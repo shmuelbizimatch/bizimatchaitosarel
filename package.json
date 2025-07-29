@@ -1,0 +1,44 @@
+{
+  "name": "claude-agent-system",
+  "version": "1.0.0",
+  "description": "Autonomous Agent System optimized for Claude with Supabase backend",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node agent-core/agent.ts",
+    "start": "node dist/agent.js",
+    "test": "jest",
+    "setup": "npm run build && npm run setup-db"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.38.0",
+    "@anthropic-ai/sdk": "^0.13.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "uuid": "^9.0.1",
+    "chalk": "^4.1.2",
+    "fs-extra": "^11.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.0",
+    "@types/express": "^4.17.17",
+    "@types/cors": "^2.8.14",
+    "@types/uuid": "^9.0.4",
+    "@types/fs-extra": "^11.0.2",
+    "typescript": "^5.2.2",
+    "ts-node": "^10.9.1",
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.5"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "claude",
+    "supabase",
+    "autonomous",
+    "typescript"
+  ],
+  "author": "Claude Agent System",
+  "license": "MIT"
+}
