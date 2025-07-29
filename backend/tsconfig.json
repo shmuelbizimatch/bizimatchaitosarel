@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ES2020",
     "module": "commonjs",
-    "lib": ["ES2020", "DOM"],
+    "lib": ["ES2020"],
     "outDir": "./dist",
     "rootDir": "./",
     "strict": true,
@@ -15,30 +15,26 @@
     "resolveJsonModule": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
-    "jsx": "react-jsx",
     "allowSyntheticDefaultImports": true,
     "baseUrl": ".",
     "paths": {
       "@/*": ["./*"],
-      "@backend/*": ["./backend/*"],
-      "@frontend/*": ["./frontend/*"]
+      "@agent-core/*": ["./agent-core/*"],
+      "@api/*": ["./api/*"],
+      "@types/*": ["./types/*"],
+      "@setup/*": ["./setup/*"]
     }
   },
   "include": [
-    "backend/**/*",
-    "scripts/**/*"
+    "agent-core/**/*",
+    "api/**/*",
+    "types/**/*",
+    "setup/**/*"
   ],
   "exclude": [
     "node_modules",
     "dist",
-    "frontend",
-    "backend/node_modules",
-    "backend/dist",
     "**/*.test.ts",
     "**/*.spec.ts"
-  ],
-  "references": [
-    { "path": "./backend" },
-    { "path": "./frontend" }
   ]
 }

@@ -2,43 +2,34 @@
   "name": "claude-agent-system",
   "version": "1.0.0",
   "description": "Autonomous Agent System optimized for Claude with Supabase backend",
-  "main": "dist/index.js",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
   "scripts": {
-    "build": "tsc",
-    "dev": "ts-node agent-core/agent.ts",
-    "start": "node dist/agent.js",
-    "test": "jest",
+    "install:all": "npm install && cd frontend && npm install && cd ../backend && npm install",
+    "build": "npm run build:backend && npm run build:frontend",
+    "build:frontend": "cd frontend && npm run build",
+    "build:backend": "cd backend && npm run build",
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "dev:frontend": "cd frontend && npm start",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:agent": "cd backend && npm run dev:agent",
+    "dev:api": "cd backend && npm run dev:api",
+    "start": "concurrently \"npm run start:frontend\" \"npm run start:backend\"",
+    "start:frontend": "cd frontend && npm start",
+    "start:backend": "cd backend && npm run start",
+    "test": "npm run test:frontend && npm run test:backend",
+    "test:frontend": "cd frontend && npm test",
+    "test:backend": "cd backend && npm test",
     "check": "node scripts/check-prerequisites.js",
-    "setup": "npm run check && npm run build && npm run setup-db",
-    "setup-db": "node dist/setup/database.js",
-    "frontend": "cd frontend && npm start",
-    "api": "ts-node api/server.ts"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.13.1",
-    "@supabase/supabase-js": "^2.38.0",
-    "@types/socket.io": "^3.0.1",
-    "chalk": "^4.1.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "fs-extra": "^11.1.1",
-    "glob": "^10.3.10",
-    "socket.io": "^4.8.1",
-    "socket.io-client": "^4.8.1",
-    "typescript-parser": "^2.6.1",
-    "uuid": "^9.0.1"
+    "setup": "npm run install:all && npm run check && npm run build && npm run setup-db",
+    "setup-db": "cd backend && npm run setup-db",
+    "clean": "rm -rf frontend/build backend/dist frontend/node_modules backend/node_modules node_modules"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.14",
-    "@types/express": "^4.17.17",
-    "@types/fs-extra": "^11.0.2",
-    "@types/jest": "^29.5.5",
-    "@types/node": "^20.8.0",
-    "@types/uuid": "^9.0.4",
-    "jest": "^29.7.0",
-    "ts-node": "^10.9.1",
-    "typescript": "^5.2.2"
+    "concurrently": "^8.2.2"
   },
   "keywords": [
     "ai",
@@ -46,7 +37,9 @@
     "claude",
     "supabase",
     "autonomous",
-    "typescript"
+    "typescript",
+    "react",
+    "workspace"
   ],
   "author": "Claude Agent System",
   "license": "MIT"
