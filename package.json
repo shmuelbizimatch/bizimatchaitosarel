@@ -8,7 +8,8 @@
     "dev": "ts-node agent-core/agent.ts",
     "start": "node dist/agent.js",
     "test": "jest",
-    "setup": "npm run build && npm run setup-db",
+    "check": "node scripts/check-prerequisites.js",
+    "setup": "npm run check && npm run build && npm run setup-db",
     "setup-db": "node dist/setup/database.js",
     "frontend": "cd frontend && npm start",
     "api": "ts-node api/server.ts"
