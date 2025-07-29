@@ -45,29 +45,35 @@ A comprehensive autonomous AI agent system optimized for Claude 3.5 Sonnet with 
    ```bash
    cp .env.example .env
    # Edit .env with your API keys:
-   # - ANTHROPIC_API_KEY=your_claude_api_key
-   # - SUPABASE_URL=your_supabase_url
-   # - SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+   # - ANTHROPIC_API_KEY=sk-ant-api03-your-actual-key (get from https://console.anthropic.com/)
+   # - SUPABASE_URL=your_supabase_url (optional for basic testing)
+   # - SUPABASE_SERVICE_ROLE_KEY=your_service_role_key (optional for basic testing)
    ```
 
-3. **Build and Setup Database**
+3. **Build the Project**
    ```bash
    npm run build
-   npm run setup-db
    ```
 
-4. **Start the System**
+4. **Setup Database (Optional)**
+   ```bash
+   # Only run this if you have configured Supabase credentials
+   npm run setup-db
+   ```
+   > **Note**: The system can run without Supabase for basic functionality, but you'll need it for persistent memory and logging.
+
+5. **Start the System**
    ```bash
    # Terminal 1: Start API server
    npm run api
 
-   # Terminal 2: Start frontend
+   # Terminal 2: Start frontend (in a new terminal)
    npm run frontend
    ```
 
-5. **Access the Interface**
-   - Frontend: http://localhost:3000
-   - API Health: http://localhost:3001/api/health
+6. **Access the Interface**
+   - Frontend: http://localhost:3000 (React development server)
+   - API Health: http://localhost:3001/api/health (Express API server)
 
 ## 📋 Usage
 
@@ -215,9 +221,9 @@ cd frontend && npm test  # Run frontend tests
 
 ### Development Mode
 ```bash
-npm run dev           # Start backend in dev mode
-npm run api           # Start API server
-npm run frontend      # Start React dev server
+npm run dev           # Start backend in dev mode (runs agent directly)
+npm run api           # Start API server on port 3001
+npm run frontend      # Start React dev server on port 3000 (proxies to API)
 ```
 
 ## 🔍 Monitoring & Debugging
@@ -241,6 +247,60 @@ npm run frontend      # Start React dev server
 3. Use frontend monitoring panel for real-time insights
 4. Verify API keys and Supabase connectivity
 5. Check network connectivity for AI service calls
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+#### "API server not responding" / "fetch failed" errors
+- **Cause**: Incorrect port configuration or missing environment variables
+- **Solution**: 
+  1. Verify the API server is running on port 3001: `curl http://localhost:3001/api/health`
+  2. Check that `PORT=3001` is set in your `.env` file
+  3. Ensure no other service is using port 3001
+
+#### "TypeError: fetch failed" during database setup
+- **Cause**: Invalid or missing Supabase credentials
+- **Solution**: 
+  1. Verify your Supabase URL and service role key in `.env`
+  2. Test Supabase connection manually: `curl -H "apikey: YOUR_KEY" YOUR_SUPABASE_URL/rest/v1/`
+  3. You can skip database setup for basic testing: comment out `npm run setup-db`
+
+#### Frontend shows "Endpoint not found" error
+- **Cause**: Port conflict or incorrect configuration between API and frontend servers
+- **Solution**: 
+  1. Make sure API server runs on port 3001 and frontend on port 3000
+  2. Stop any existing servers and restart them separately
+  3. Access frontend at `http://localhost:3000` and API at `http://localhost:3001/api/*`
+  4. Check that frontend's `package.json` has proxy set to `http://localhost:3001`
+
+#### "ANTHROPIC_API_KEY" errors
+- **Cause**: Missing or invalid Anthropic API key
+- **Solution**: 
+  1. Get a valid API key from [Anthropic Console](https://console.anthropic.com/)
+  2. Set it in your `.env` file: `ANTHROPIC_API_KEY=sk-ant-api03-your-actual-key`
+  3. Restart the API server after updating the key
+
+#### Build failures
+- **Cause**: TypeScript compilation errors or missing dependencies
+- **Solution**:
+  1. Run `npm install` to ensure all dependencies are installed
+  2. Check for TypeScript errors: `npx tsc --noEmit`
+  3. Clear node_modules and reinstall: `rm -rf node_modules && npm install`
+
+### Port Configuration
+- **API Server**: Runs on port 3001 (configurable via `PORT` environment variable)
+- **Frontend**: Runs on port 3000 when started with `npm run frontend` (React dev server)
+- **Note**: Frontend proxies API requests to port 3001 via the proxy setting in frontend/package.json
+
+### Environment Variables
+Required for basic functionality:
+- `ANTHROPIC_API_KEY`: Your Claude API key (required for AI features)
+- `PORT`: API server port (defaults to 3001)
+
+Optional for advanced features:
+- `SUPABASE_URL`: Your Supabase project URL
+- `SUPABASE_SERVICE_ROLE_KEY`: Service role key for database access
 
 ## 🤝 Contributing
 
