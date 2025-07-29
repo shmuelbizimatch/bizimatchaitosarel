@@ -171,6 +171,16 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     }));
   };
 
+  // Security function to sanitize display content
+  const sanitizeForDisplay = (text: string): string => {
+    return text
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#x27;')
+      .replace(/\//g, '&#x2F;');
+  };
+
   const getAgentStatusColor = (status: string): string => {
     switch (status) {
       case 'pending': return '#6b7280';
@@ -258,8 +268,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             </label>
             <input
               type="text"
-              value={state.project}
-              onChange={(e) => setState(prev => ({ ...prev, project: e.target.value }))}
+                          value={state.project}
+            onChange={(e) => setState(prev => ({ ...prev, project: sanitizeForDisplay(e.target.value) }))}
               placeholder="Enter project name"
               disabled={state.isRunning}
               style={{
@@ -772,7 +782,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                           fontSize: '10px',
                           overflow: 'auto'
                         }}>
-                          {JSON.stringify(log.data, null, 2)}
+                          {sanitizeForDisplay(JSON.stringify(log.data, null, 2))}
                         </pre>
                       </details>
                     )}

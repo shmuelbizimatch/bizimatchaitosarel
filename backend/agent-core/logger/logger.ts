@@ -99,10 +99,14 @@ This logbook tracks all activities of the autonomous agent system. Each session 
     console.log(`${prefix} ${entry.message}`);
     
     if (entry.data && Object.keys(entry.data).length > 0) {
-      console.log(chalk.gray('  Data:'), JSON.stringify(entry.data, null, 2));
+      if (this.containsSensitiveData(entry.data)) {
+        console.log(chalk.gray('  Data:'), '[SENSITIVE DATA REDACTED]');
+      } else {
+        console.log(chalk.gray('  Data:'), JSON.stringify(this.sanitizeLogData(entry.data), null, 2));
+      }
     }
     
-    if (entry.error_stack) {
+    if (entry.error_stack && process.env.NODE_ENV === 'development') {
       console.log(chalk.red('  Stack:'), entry.error_stack);
     }
   }
@@ -360,5 +364,46 @@ This logbook tracks all activities of the autonomous agent system. Each session 
     } catch (error) {
       console.error('Error during log cleanup:', error);
     }
+  }
+
+  private containsSensitiveData(data: any): boolean {
+    const sensitiveKeys = [
+      'password', 'token', 'key', 'secret', 'api_key', 'apikey',
+      'auth', 'credential', 'private', 'confidential', 'salt',
+      'hash', 'signature', 'authorization'
+    ];
+    
+    const dataString = JSON.stringify(data).toLowerCase();
+    return sensitiveKeys.some(key => dataString.includes(key));
+  }
+
+  private sanitizeLogData(data: any): any {
+    if (typeof data === 'string') {
+      // Redact potential API keys, tokens, etc.
+      return data.replace(/([a-zA-Z0-9_-]{32,})/g, '[REDACTED]');
+    }
+    
+    if (Array.isArray(data)) {
+      return data.map(item => this.sanitizeLogData(item));
+    }
+    
+    if (data && typeof data === 'object') {
+      const sanitized: any = {};
+      for (const key in data) {
+        if (data.hasOwnProperty(key)) {
+          const lowerKey = key.toLowerCase();
+          if (lowerKey.includes('password') || lowerKey.includes('token') || 
+              lowerKey.includes('key') || lowerKey.includes('secret') ||
+              lowerKey.includes('auth') || lowerKey.includes('credential')) {
+            sanitized[key] = '[REDACTED]';
+          } else {
+            sanitized[key] = this.sanitizeLogData(data[key]);
+          }
+        }
+      }
+      return sanitized;
+    }
+    
+    return data;
   }
 }

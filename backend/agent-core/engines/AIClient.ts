@@ -39,12 +39,15 @@ export class AIClient {
     this.requestCount++;
 
     try {
+      // Validate and sanitize input
+      const sanitizedRequest = this.sanitizeRequest(request);
+      
       // For now, we only support Claude. Future engines can be added here
       if (aiEngine !== 'claude') {
         throw new Error(`AI Engine ${aiEngine} is not yet supported. Currently only 'claude' is available.`);
       }
 
-      const response = await this.callClaude(request);
+      const response = await this.callClaude(sanitizedRequest);
       
       this.totalTokensUsed += response.tokens_used;
       this.totalCost += response.cost_estimate;
@@ -381,5 +384,41 @@ Please provide a JSON response with the following structure:
     this.requestCount = 0;
     this.totalTokensUsed = 0;
     this.totalCost = 0;
+  }
+
+  // Security methods
+  private sanitizeRequest(request: AIRequest): AIRequest {
+    return {
+      ...request,
+      prompt: this.sanitizeInput(request.prompt),
+      context: request.context ? this.sanitizeInput(request.context) : undefined,
+      system_prompt: request.system_prompt ? this.sanitizeInput(request.system_prompt) : undefined,
+      max_tokens: Math.min(request.max_tokens || 4000, 10000), // Limit max tokens
+      temperature: Math.max(0, Math.min(request.temperature || 0.1, 1)) // Clamp temperature
+    };
+  }
+
+  private sanitizeInput(input: string): string {
+    // Remove potential injection attempts
+    return input
+      .replace(/```[\s\S]*?```/g, '[CODE_BLOCK_REMOVED]') // Remove code blocks
+      .replace(/<script[\s\S]*?<\/script>/gi, '[SCRIPT_REMOVED]') // Remove script tags
+      .replace(/javascript:/gi, '[JS_PROTOCOL_REMOVED]') // Remove javascript: protocol
+      .replace(/data:text\/html/gi, '[DATA_URL_REMOVED]') // Remove data URLs
+      .replace(/\$\{[^}]*\}/g, '[TEMPLATE_LITERAL_REMOVED]') // Remove template literals
+      .substring(0, 50000); // Limit input length
+  }
+
+  private validateResponse(content: string): boolean {
+    // Check for potentially dangerous content in AI response
+    const dangerousPatterns = [
+      /<script/i,
+      /javascript:/i,
+      /data:text\/html/i,
+      /eval\(/i,
+      /Function\(/i
+    ];
+    
+    return !dangerousPatterns.some(pattern => pattern.test(content));
   }
 }
