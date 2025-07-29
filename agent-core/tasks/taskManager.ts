@@ -669,10 +669,10 @@ export class TaskManager {
 
       data?.forEach((task: any) => {
         // Count by status
-        stats.by_status[task.status] = (stats.by_status[task.status] || 0) + 1;
+        stats.by_status[task.status as TaskStatus] = (stats.by_status[task.status as TaskStatus] || 0) + 1;
         
         // Count by agent
-        stats.by_agent[task.agent_type] = (stats.by_agent[task.agent_type] || 0) + 1;
+        stats.by_agent[task.agent_type as AgentType] = (stats.by_agent[task.agent_type as AgentType] || 0) + 1;
         
         // Sum tokens and cost
         stats.total_tokens += task.tokens_used || 0;

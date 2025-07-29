@@ -458,33 +458,32 @@ export class MemoryManager {
 
   // Cache management methods
   private addToCache(projectId: string, memory: ProjectMemory): void {
-    const cached = this.memoryCache.get(projectId) || [];
-    cached.unshift(memory); // Add to beginning
+    let projectMemories = this.memoryCache.get(projectId) || [];
+    projectMemories.unshift(memory);
     
-    // Limit cache size
-    if (cached.length > this.maxCacheSize) {
-      cached.splice(this.maxCacheSize);
+    // Keep cache size manageable
+    if (projectMemories.length > this.maxCacheSize) {
+      projectMemories = projectMemories.slice(0, this.maxCacheSize);
     }
     
-    this.memoryCache.set(projectId, cached);
+    this.memoryCache.set(projectId, projectMemories);
   }
 
-  private updateInCache(memory: ProjectMemory): void {
-    const cached = this.memoryCache.get(memory.project_id);
-    if (cached) {
-      const index = cached.findIndex(m => m.id === memory.id);
+  private updateInCache(updatedMemory: ProjectMemory): void {
+    for (const [projectId, memories] of this.memoryCache.entries()) {
+      const index = memories.findIndex(m => m.id === updatedMemory.id);
       if (index !== -1) {
-        cached[index] = memory;
+        memories[index] = updatedMemory;
+        break;
       }
     }
   }
 
   private removeFromCache(memoryId: string): void {
     for (const [projectId, memories] of this.memoryCache.entries()) {
-      const index = memories.findIndex(m => m.id === memoryId);
-      if (index !== -1) {
-        memories.splice(index, 1);
-        this.memoryCache.set(projectId, memories);
+      const filteredMemories = memories.filter(m => m.id !== memoryId);
+      if (filteredMemories.length !== memories.length) {
+        this.memoryCache.set(projectId, filteredMemories);
         break;
       }
     }
@@ -494,20 +493,19 @@ export class MemoryManager {
     if (memoryIds.length === 0) return;
 
     try {
-      // Update access count and last_accessed timestamp
       const now = new Date().toISOString();
       
       for (const memoryId of memoryIds) {
         await this.supabase
           .from('memory')
-          .update({ 
+          .update({
             last_accessed: now,
-            access_count: this.supabase.raw('access_count + 1')
+            access_count: (this.supabase as any).sql`access_count + 1`
           })
           .eq('id', memoryId);
       }
     } catch (error) {
-      await this.logger.warn('orchestrator', 'Failed to update memory access counts', {
+      await this.logger.debug('orchestrator', 'Failed to update memory access counts', {
         memory_ids: memoryIds,
         error: error instanceof Error ? error.message : String(error)
       });
@@ -520,13 +518,12 @@ export class MemoryManager {
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
 
-      // Only cleanup low importance, rarely accessed memories
+      // Only cleanup low-importance memories that haven't been accessed recently
       const { error } = await this.supabase
         .from('memory')
         .delete()
-        .lt('last_accessed', cutoffDate.toISOString())
         .lt('importance_score', 4)
-        .lt('access_count', 3);
+        .lt('last_accessed', cutoffDate.toISOString());
 
       if (error) {
         await this.logger.error('orchestrator', 'Failed to cleanup old memories', {
@@ -545,14 +542,14 @@ export class MemoryManager {
     }
   }
 
-  // Export/Import for backup and migration
+  // Export/Import for data management
   async exportProjectMemories(projectId: string): Promise<ProjectMemory[]> {
     try {
       const { data, error } = await this.supabase
         .from('memory')
         .select('*')
         .eq('project_id', projectId)
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending: true });
 
       if (error) {
         throw new Error(`Failed to export memories: ${error.message}`);
@@ -573,29 +570,59 @@ export class MemoryManager {
     }
   }
 
-  async importProjectMemories(memories: ProjectMemory[]): Promise<number> {
+  async importProjectMemories(projectId: string, memories: ProjectMemory[]): Promise<number> {
     try {
-      const { data, error } = await this.supabase
-        .from('memory')
-        .insert(memories)
-        .select();
+      let importedCount = 0;
 
-      if (error) {
-        throw new Error(`Failed to import memories: ${error.message}`);
+      for (const memory of memories) {
+        const newMemory = {
+          ...memory,
+          id: uuidv4(), // Generate new IDs to avoid conflicts
+          project_id: projectId,
+          created_at: new Date().toISOString(),
+          last_accessed: new Date().toISOString(),
+          access_count: 0
+        };
+
+        const { error } = await this.supabase
+          .from('memory')
+          .insert([newMemory]);
+
+        if (!error) {
+          importedCount++;
+        }
       }
 
-      const importedCount = data?.length || 0;
-      
       await this.logger.info('orchestrator', `Imported ${importedCount} memories`, {
-        imported_count: importedCount
+        project_id: projectId,
+        imported_count: importedCount,
+        total_attempted: memories.length
       });
 
       return importedCount;
     } catch (error) {
       await this.logger.error('orchestrator', 'Failed to import project memories', {
+        project_id: projectId,
         error: error instanceof Error ? error.message : String(error)
       });
       return 0;
     }
+  }
+
+  // Clear cache for a project
+  clearProjectCache(projectId: string): void {
+    this.memoryCache.delete(projectId);
+  }
+
+  // Get cache statistics
+  getCacheStats(): Record<string, any> {
+    const totalMemories = Array.from(this.memoryCache.values())
+      .reduce((sum, memories) => sum + memories.length, 0);
+    
+    return {
+      cached_projects: this.memoryCache.size,
+      total_cached_memories: totalMemories,
+      cache_size_limit: this.maxCacheSize
+    };
   }
 }

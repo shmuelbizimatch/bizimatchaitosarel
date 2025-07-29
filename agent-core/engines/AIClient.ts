@@ -90,7 +90,7 @@ export class AIClient {
     try {
       const systemPrompt = request.system_prompt || this.getDefaultSystemPrompt();
       
-      const response = await this.anthropic.messages.create({
+      const response = await (this.anthropic as any).messages.create({
         model: model,
         max_tokens: request.max_tokens || 4000,
         temperature: request.temperature || 0.1,
@@ -116,8 +116,8 @@ export class AIClient {
 
       // Extract content
       const content = response.content
-        .filter(block => block.type === 'text')
-        .map(block => (block as any).text)
+        .filter((block: any) => block.type === 'text')
+        .map((block: any) => (block as any).text)
         .join('\n');
 
       return {

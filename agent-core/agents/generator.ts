@@ -1,94 +1,77 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import { ModuleGenerationResult, GeneratedModule, Task } from '../../types';
-import { Logger } from '../logger/logger';
+import { ModuleGenerationResult, Task, GeneratedModule, ScanResult, EnhancementResult } from '../../types';
 import { AIClient } from '../engines/AIClient';
+import { Logger } from '../logger/logger';
 import { MemoryManager } from '../memory/memoryManager';
-import { TaskManager } from '../tasks/taskManager';
 
 export class GeneratorAgent {
-  private logger: Logger;
   private aiClient: AIClient;
+  private logger: Logger;
   private memoryManager: MemoryManager;
-  private taskManager: TaskManager;
 
-  constructor(
-    logger: Logger,
-    aiClient: AIClient,
-    memoryManager: MemoryManager,
-    taskManager: TaskManager
-  ) {
-    this.logger = logger;
+  constructor(aiClient: AIClient, logger: Logger, memoryManager: MemoryManager) {
     this.aiClient = aiClient;
+    this.logger = logger;
     this.memoryManager = memoryManager;
-    this.taskManager = taskManager;
   }
 
-  async executeTask(task: Task): Promise<ModuleGenerationResult> {
-    await this.logger.info('generator', 'Starting module generation task', {
-      task_id: task.id,
-      project_id: task.project_id
-    });
+  async generate(task: Task): Promise<ModuleGenerationResult> {
+    await this.logger.info('generator', `Starting module generation for task: ${task.id}`);
+    
+    const moduleRequest = task.input_data.module_request;
+    const scanResults = task.input_data.scan_results as ScanResult;
+    const enhancementResults = task.input_data.enhancement_results as EnhancementResult;
+    const projectPath = task.input_data.project_path || process.cwd();
 
     try {
-      // Extract generation parameters from task input
-      const { moduleRequest, existingPatterns, frameworks, targetDirectory } = task.input_data;
+      // 1. Validate generation request
+      if (!moduleRequest) {
+        throw new Error('No module generation request provided');
+      }
+
+      // 2. Analyze existing codebase patterns
+      const existingPatterns = await this.analyzeExistingPatterns(scanResults, projectPath);
       
-      // Set context for logging
-      this.logger.setContext(task.project_id, task.id);
-
-      // Start the task
-      await this.taskManager.startTask(task.id);
-
-      // Step 1: Analyze project context and existing patterns
-      const projectContext = await this.buildProjectContext(task.project_id, targetDirectory);
-
-      // Step 2: Get existing code patterns from memory
-      const codePatterns = await this.getCodePatterns(task.project_id);
+      // 3. Get project frameworks and preferences
+      const projectContext = await this.gatherProjectContext(task.project_id, scanResults);
       
-      // Step 3: Analyze existing project structure
-      const projectStructure = await this.analyzeProjectStructure(targetDirectory || process.cwd());
-
-      // Step 4: Generate modules using Claude
-      const generatedModules = await this.generateModules(
+      // 4. Generate AI-powered modules
+      const aiGeneration = await this.generateAIModules(
         moduleRequest,
-        projectContext,
-        codePatterns,
-        projectStructure,
         existingPatterns,
-        frameworks
+        projectContext.frameworks,
+        projectContext
       );
+      
+      // 5. Enhance with local analysis
+      const enhancedModules = await this.enhanceGeneratedModules(
+        aiGeneration.generated_modules || [],
+        existingPatterns,
+        projectPath
+      );
+      
+      // 6. Generate integration instructions
+      const integrationInstructions = this.createIntegrationInstructions(
+        enhancedModules,
+        existingPatterns,
+        projectPath
+      );
+      
+      // 7. Generate testing suggestions
+      const testingSuggestions = this.createTestingSuggestions(enhancedModules, existingPatterns);
+      
+      // 8. Store generation insights
+      await this.storeGenerationInsights(task.project_id, enhancedModules, moduleRequest);
 
-      // Step 5: Validate and enhance generated modules
-      const validatedModules = await this.validateAndEnhanceModules(generatedModules, targetDirectory);
-
-      // Step 6: Create integration instructions
-      const integrationInstructions = await this.createIntegrationInstructions(validatedModules, projectStructure);
-
-      // Step 7: Generate testing suggestions
-      const testingSuggestions = await this.createTestingSuggestions(validatedModules);
-
-      // Step 8: Compile generation results
       const generationResult: ModuleGenerationResult = {
-        generated_modules: validatedModules,
+        generated_modules: enhancedModules,
         integration_instructions: integrationInstructions,
         testing_suggestions: testingSuggestions
       };
 
-      // Store generation insights in memory
-      await this.storeGenerationInsights(task.project_id, generationResult, moduleRequest);
-
-      // Complete the task
-      await this.taskManager.completeTask(
-        task.id,
-        { generation_result: generationResult },
-        generatedModules.reduce((sum, mod) => sum + (mod.tokensUsed || 0), 0),
-        generatedModules.reduce((sum, mod) => sum + (mod.costEstimate || 0), 0)
-      );
-
-      await this.logger.info('generator', 'Module generation task completed successfully', {
-        task_id: task.id,
-        modules_generated: validatedModules.length,
+      await this.logger.info('generator', `Module generation completed successfully`, {
+        modules_generated: enhancedModules.length,
         integration_steps: integrationInstructions.length,
         testing_suggestions: testingSuggestions.length
       });
@@ -96,650 +79,902 @@ export class GeneratorAgent {
       return generationResult;
 
     } catch (error) {
-      await this.logger.error('generator', 'Module generation task failed', {
-        task_id: task.id,
-        error: error instanceof Error ? error.message : String(error)
-      }, error instanceof Error ? error : undefined);
-
-      await this.taskManager.failTask(
-        task.id,
-        error instanceof Error ? error.message : String(error),
-        error instanceof Error ? error.stack : undefined
-      );
-
-      throw error;
-    }
-  }
-
-  private async buildProjectContext(projectId: string, targetDirectory?: string): Promise<string> {
-    let context = `Module Generation Context:\n\n`;
-
-    try {
-      // Get project insights from memory
-      const insights = await this.memoryManager.getInsights(projectId, 5);
-      if (insights.length > 0) {
-        context += `Project Insights:\n`;
-        insights.forEach(insight => {
-          context += `- ${insight.content.insight}\n`;
-        });
-        context += '\n';
-      }
-
-      // Get successful patterns from memory
-      const successPatterns = await this.memoryManager.getSuccesses(projectId, 5);
-      if (successPatterns.length > 0) {
-        context += `Successful Patterns:\n`;
-        successPatterns.forEach(pattern => {
-          context += `- ${pattern.content.action}: ${pattern.content.outcome}\n`;
-        });
-        context += '\n';
-      }
-
-      // Get preferences from memory
-      const preferences = await this.memoryManager.getPreferences(projectId);
-      if (preferences.length > 0) {
-        context += `Project Preferences:\n`;
-        preferences.forEach(pref => {
-          context += `- ${pref.content.preference}: ${pref.content.value}\n`;
-        });
-        context += '\n';
-      }
-
-    } catch (error) {
-      await this.logger.warn('generator', 'Failed to build project context from memory', {
-        project_id: projectId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-
-    return context;
-  }
-
-  private async getCodePatterns(projectId: string): Promise<any[]> {
-    try {
-      const patterns = await this.memoryManager.getPatterns(projectId, 10);
-      return patterns.filter(pattern =>
-        pattern.content.pattern?.includes('component') ||
-        pattern.content.pattern?.includes('service') ||
-        pattern.content.pattern?.includes('utility') ||
-        pattern.content.pattern?.includes('hook')
-      );
-    } catch (error) {
-      await this.logger.warn('generator', 'Failed to retrieve code patterns', {
-        project_id: projectId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return [];
-    }
-  }
-
-  private async analyzeProjectStructure(targetDirectory: string): Promise<any> {
-    try {
-      const structure = {
-        directories: [] as string[],
-        filePatterns: [] as string[],
-        frameworks: [] as string[],
-        conventions: [] as string[]
-      };
-
-      // Read directory structure
-      const entries = await fs.readdir(targetDirectory, { withFileTypes: true });
-      
-      structure.directories = entries
-        .filter(entry => entry.isDirectory())
-        .map(entry => entry.name)
-        .filter(name => !['node_modules', '.git', 'dist', 'build'].includes(name));
-
-      // Check for common patterns
-      if (structure.directories.includes('components')) {
-        structure.conventions.push('components directory');
-      }
-      if (structure.directories.includes('hooks')) {
-        structure.conventions.push('custom hooks directory');
-      }
-      if (structure.directories.includes('utils') || structure.directories.includes('utilities')) {
-        structure.conventions.push('utilities directory');
-      }
-      if (structure.directories.includes('services')) {
-        structure.conventions.push('services directory');
-      }
-
-      // Check package.json for frameworks
-      try {
-        const packageJsonPath = path.join(targetDirectory, 'package.json');
-        const packageContent = await fs.readFile(packageJsonPath, 'utf-8');
-        const packageJson = JSON.parse(packageContent);
-        
-        const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
-        
-        if (deps.react) structure.frameworks.push('React');
-        if (deps.vue) structure.frameworks.push('Vue');
-        if (deps['@angular/core']) structure.frameworks.push('Angular');
-        if (deps.typescript) structure.frameworks.push('TypeScript');
-        if (deps['styled-components']) structure.frameworks.push('Styled Components');
-        if (deps['@emotion/react']) structure.frameworks.push('Emotion');
-        if (deps.tailwindcss) structure.frameworks.push('Tailwind CSS');
-
-      } catch (error) {
-        await this.logger.debug('generator', 'Could not read package.json for framework detection');
-      }
-
-      // Sample existing files for patterns
-      const sampleFiles = await this.sampleExistingFiles(targetDirectory);
-      structure.filePatterns = this.extractFilePatterns(sampleFiles);
-
-      return structure;
-
-    } catch (error) {
-      await this.logger.error('generator', 'Failed to analyze project structure', {
-        target_directory: targetDirectory,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return { directories: [], filePatterns: [], frameworks: [], conventions: [] };
-    }
-  }
-
-  private async sampleExistingFiles(targetDirectory: string): Promise<Array<{ path: string; content: string }>> {
-    const samples: Array<{ path: string; content: string }> = [];
-
-    try {
-      const findFiles = async (dir: string, depth: number = 0): Promise<string[]> => {
-        if (depth > 2) return []; // Limit depth to avoid deep recursion
-
-        const files: string[] = [];
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-          const relativePath = path.relative(targetDirectory, fullPath);
-
-          if (entry.isDirectory() && !['node_modules', '.git', 'dist', 'build'].includes(entry.name)) {
-            const subFiles = await findFiles(fullPath, depth + 1);
-            files.push(...subFiles);
-          } else if (entry.isFile() && /\.(tsx?|jsx?|vue|svelte)$/.test(entry.name)) {
-            files.push(relativePath);
-          }
-        }
-
-        return files;
-      };
-
-      const files = await findFiles(targetDirectory);
-      
-      // Sample up to 10 files
-      const samplePaths = files.slice(0, 10);
-
-      for (const filePath of samplePaths) {
-        try {
-          const fullPath = path.join(targetDirectory, filePath);
-          const content = await fs.readFile(fullPath, 'utf-8');
-          
-          // Limit content size
-          const limitedContent = content.length > 3000 ? content.slice(0, 3000) + '\n...' : content;
-          
-          samples.push({ path: filePath, content: limitedContent });
-        } catch (error) {
-          // Skip files that can't be read
-          continue;
-        }
-      }
-
-    } catch (error) {
-      await this.logger.warn('generator', 'Failed to sample existing files', {
-        target_directory: targetDirectory,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-
-    return samples;
-  }
-
-  private extractFilePatterns(files: Array<{ path: string; content: string }>): string[] {
-    const patterns: string[] = [];
-
-    files.forEach(file => {
-      const content = file.content;
-
-      // React patterns
-      if (content.includes('import React') || content.includes('from \'react\'')) {
-        patterns.push('React imports');
-      }
-      if (content.includes('export default function') || content.includes('export const')) {
-        patterns.push('Named exports');
-      }
-      if (content.includes('interface ') && content.includes('Props')) {
-        patterns.push('Props interfaces');
-      }
-      if (content.includes('useState') || content.includes('useEffect')) {
-        patterns.push('React hooks');
-      }
-      if (content.includes('styled-components') || content.includes('styled.')) {
-        patterns.push('Styled components');
-      }
-      if (content.includes('className=')) {
-        patterns.push('CSS classes');
-      }
-
-      // TypeScript patterns
-      if (content.includes(': React.FC') || content.includes(': FC')) {
-        patterns.push('Functional component typing');
-      }
-      if (content.includes('type ') || content.includes('interface ')) {
-        patterns.push('TypeScript types');
-      }
-
-      // Testing patterns
-      if (content.includes('test(') || content.includes('it(') || content.includes('describe(')) {
-        patterns.push('Testing structure');
-      }
-    });
-
-    // Remove duplicates
-    return [...new Set(patterns)];
-  }
-
-  private async generateModules(
-    moduleRequest: string,
-    projectContext: string,
-    codePatterns: any[],
-    projectStructure: any,
-    existingPatterns?: string[],
-    frameworks?: string[]
-  ): Promise<(GeneratedModule & { tokensUsed?: number; costEstimate?: number })[]> {
-    try {
-      // Build comprehensive context for Claude
-      let enhancedContext = projectContext;
-
-      enhancedContext += `\nProject Structure:\n`;
-      enhancedContext += `- Directories: ${projectStructure.directories.join(', ')}\n`;
-      enhancedContext += `- Frameworks: ${projectStructure.frameworks.join(', ')}\n`;
-      enhancedContext += `- Conventions: ${projectStructure.conventions.join(', ')}\n`;
-      enhancedContext += `- File Patterns: ${projectStructure.filePatterns.join(', ')}\n\n`;
-
-      if (codePatterns.length > 0) {
-        enhancedContext += `\nExisting Code Patterns:\n`;
-        codePatterns.forEach(pattern => {
-          enhancedContext += `- ${pattern.content.pattern}\n`;
-        });
-        enhancedContext += '\n';
-      }
-
-      if (existingPatterns && existingPatterns.length > 0) {
-        enhancedContext += `\nSpecified Patterns to Follow: ${existingPatterns.join(', ')}\n`;
-      }
-
-      if (frameworks && frameworks.length > 0) {
-        enhancedContext += `\nPreferred Frameworks: ${frameworks.join(', ')}\n`;
-      }
-
-      // Get Claude's module generation
-      const aiRequest = AIClient.getGeneratorPrompt(moduleRequest, existingPatterns, frameworks);
-      aiRequest.context = enhancedContext;
-      
-      const response = await this.aiClient.generateResponse(aiRequest);
-
-      // Parse Claude's response
-      let generationData;
-      try {
-        generationData = JSON.parse(response.content);
-      } catch (parseError) {
-        await this.logger.error('generator', 'Failed to parse Claude generation response', {
-          response_content: response.content.slice(0, 500)
-        });
-        throw new Error('Invalid response format from Claude');
-      }
-
-      // Transform Claude's modules into our format
-      const modules: (GeneratedModule & { tokensUsed?: number; costEstimate?: number })[] = 
-        (generationData.generated_modules || []).map((mod: any) => ({
-          name: mod.name || 'UnnamedModule',
-          type: mod.type || 'component',
-          file_path: mod.file_path || this.generateFilePath(mod.name, mod.type, projectStructure),
-          code: mod.code || '// Generated code placeholder',
-          dependencies: mod.dependencies || [],
-          props_interface: mod.props_interface || '',
-          usage_example: mod.usage_example || '',
-          tests: mod.tests || '',
-          tokensUsed: Math.round(response.tokens_used / (generationData.generated_modules?.length || 1)),
-          costEstimate: response.cost_estimate / (generationData.generated_modules?.length || 1)
-        }));
-
-      return modules;
-
-    } catch (error) {
-      await this.logger.error('generator', 'Failed to generate modules', {
+      await this.logger.error('generator', 'Module generation failed', {
+        project_path: projectPath,
         module_request: moduleRequest,
         error: error instanceof Error ? error.message : String(error)
-      });
-      return [];
+      }, error as Error);
+      
+      throw new Error(`Generator analysis failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private generateFilePath(moduleName: string, moduleType: string, projectStructure: any): string {
-    const name = moduleName.replace(/\s+/g, '');
-    
-    switch (moduleType) {
-      case 'component':
-        if (projectStructure.directories.includes('components')) {
-          return `components/${name}.tsx`;
-        } else if (projectStructure.directories.includes('src')) {
-          return `src/components/${name}.tsx`;
-        }
-        return `${name}.tsx`;
+  private async analyzeExistingPatterns(scanResults: ScanResult | undefined, projectPath: string): Promise<any> {
+    const patterns = {
+      frameworks: [] as string[],
+      component_patterns: [] as string[],
+      service_patterns: [] as string[],
+      utility_patterns: [] as string[],
+      styling_approach: 'unknown',
+      state_management: 'unknown',
+      testing_framework: 'unknown',
+      naming_conventions: {} as Record<string, string[]>,
+      folder_structure: {} as Record<string, string[]>
+    };
 
-      case 'service':
-        if (projectStructure.directories.includes('services')) {
-          return `services/${name}.ts`;
-        } else if (projectStructure.directories.includes('src')) {
-          return `src/services/${name}.ts`;
-        }
-        return `${name}.ts`;
-
-      case 'utility':
-        if (projectStructure.directories.includes('utils')) {
-          return `utils/${name}.ts`;
-        } else if (projectStructure.directories.includes('utilities')) {
-          return `utilities/${name}.ts`;
-        } else if (projectStructure.directories.includes('src')) {
-          return `src/utils/${name}.ts`;
-        }
-        return `utils/${name}.ts`;
-
-      case 'hook':
-        if (projectStructure.directories.includes('hooks')) {
-          return `hooks/use${name}.ts`;
-        } else if (projectStructure.directories.includes('src')) {
-          return `src/hooks/use${name}.ts`;
-        }
-        return `hooks/use${name}.ts`;
-
-      default:
-        return `${name}.ts`;
-    }
-  }
-
-  private async validateAndEnhanceModules(
-    modules: (GeneratedModule & { tokensUsed?: number; costEstimate?: number })[],
-    targetDirectory?: string
-  ): Promise<(GeneratedModule & { tokensUsed?: number; costEstimate?: number })[]> {
-    const validated: (GeneratedModule & { tokensUsed?: number; costEstimate?: number })[] = [];
-
-    for (const module of modules) {
-      try {
-        // Validate and enhance the module
-        const enhancedModule = await this.enhanceModule(module, targetDirectory);
+    try {
+      // Extract patterns from scan results
+      if (scanResults) {
+        patterns.frameworks = scanResults.structure_analysis.architecture_patterns || [];
         
-        // Check for syntax errors (basic validation)
-        if (this.validateModuleSyntax(enhancedModule)) {
-          validated.push(enhancedModule);
-        } else {
-          await this.logger.warn('generator', `Module failed syntax validation: ${module.name}`);
+        // Analyze file details for patterns
+        const fileDetails = (scanResults as any).file_details || [];
+        
+        // Component patterns
+        const componentFiles = fileDetails.filter((f: any) => f.type === 'component');
+        if (componentFiles.length > 0) {
+          patterns.component_patterns = this.extractComponentPatterns(componentFiles);
         }
-
-      } catch (error) {
-        await this.logger.warn('generator', 'Failed to validate module', {
-          module_name: module.name,
-          error: error instanceof Error ? error.message : String(error)
-        });
+        
+        // Service patterns
+        const serviceFiles = fileDetails.filter((f: any) => f.type === 'service');
+        if (serviceFiles.length > 0) {
+          patterns.service_patterns = this.extractServicePatterns(serviceFiles);
+        }
+        
+        // Utility patterns
+        const utilityFiles = fileDetails.filter((f: any) => f.type === 'utility');
+        if (utilityFiles.length > 0) {
+          patterns.utility_patterns = this.extractUtilityPatterns(utilityFiles);
+        }
+        
+        // Analyze naming conventions
+        patterns.naming_conventions = this.analyzeNamingConventions(fileDetails);
+        
+        // Analyze folder structure
+        patterns.folder_structure = this.analyzeFolderStructure(fileDetails);
       }
-    }
 
-    return validated;
+      // Detect styling approach by checking for common files
+      patterns.styling_approach = await this.detectStylingApproach(projectPath);
+      
+      // Detect state management approach
+      patterns.state_management = await this.detectStateManagement(projectPath);
+      
+      // Detect testing framework
+      patterns.testing_framework = await this.detectTestingFramework(projectPath);
+
+      return patterns;
+    } catch (error) {
+      await this.logger.warn('generator', 'Failed to analyze existing patterns', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return patterns;
+    }
   }
 
-  private async enhanceModule(
-    module: GeneratedModule & { tokensUsed?: number; costEstimate?: number },
-    targetDirectory?: string
-  ): Promise<GeneratedModule & { tokensUsed?: number; costEstimate?: number }> {
-    let enhancedCode = module.code;
+  private extractComponentPatterns(componentFiles: any[]): string[] {
+    const patterns: string[] = [];
+    
+    // Analyze component file names and paths
+    const hasHooks = componentFiles.some(f => f.path.includes('hook') || f.path.includes('use'));
+    const hasPages = componentFiles.some(f => f.path.includes('page') || f.path.includes('screen'));
+    const hasLayouts = componentFiles.some(f => f.path.includes('layout'));
+    const hasCommon = componentFiles.some(f => f.path.includes('common') || f.path.includes('shared'));
+    
+    if (hasHooks) patterns.push('Custom Hooks');
+    if (hasPages) patterns.push('Page Components');
+    if (hasLayouts) patterns.push('Layout Components');
+    if (hasCommon) patterns.push('Shared Components');
+    
+    // Check for functional vs class components
+    const hasFunctionalPattern = componentFiles.some(f => f.functions_count > f.components_count);
+    if (hasFunctionalPattern) patterns.push('Functional Components');
+    
+    return patterns;
+  }
 
-    // Add imports if missing
-    if (module.type === 'component' && !enhancedCode.includes('import React')) {
-      enhancedCode = `import React from 'react';\n\n${enhancedCode}`;
+  private extractServicePatterns(serviceFiles: any[]): string[] {
+    const patterns: string[] = [];
+    
+    const hasAPI = serviceFiles.some(f => f.path.includes('api') || f.path.includes('service'));
+    const hasUtils = serviceFiles.some(f => f.path.includes('util') || f.path.includes('helper'));
+    const hasConfig = serviceFiles.some(f => f.path.includes('config'));
+    
+    if (hasAPI) patterns.push('API Services');
+    if (hasUtils) patterns.push('Utility Services');
+    if (hasConfig) patterns.push('Configuration Services');
+    
+    return patterns;
+  }
+
+  private extractUtilityPatterns(utilityFiles: any[]): string[] {
+    const patterns: string[] = [];
+    
+    const hasHelpers = utilityFiles.some(f => f.path.includes('helper'));
+    const hasConstants = utilityFiles.some(f => f.path.includes('constant'));
+    const hasTypes = utilityFiles.some(f => f.path.includes('type') || f.path.includes('interface'));
+    
+    if (hasHelpers) patterns.push('Helper Functions');
+    if (hasConstants) patterns.push('Constants');
+    if (hasTypes) patterns.push('Type Definitions');
+    
+    return patterns;
+  }
+
+  private analyzeNamingConventions(fileDetails: any[]): Record<string, string[]> {
+    const conventions = {
+      components: [] as string[],
+      files: [] as string[],
+      folders: [] as string[]
+    };
+
+    // Analyze component naming
+    const componentFiles = fileDetails.filter((f: any) => f.type === 'component');
+    const componentNames = componentFiles.map(f => path.basename(f.path, path.extname(f.path)));
+    
+    if (componentNames.some(name => /^[A-Z]/.test(name))) {
+      conventions.components.push('PascalCase');
+    }
+    if (componentNames.some(name => name.includes('-'))) {
+      conventions.components.push('kebab-case');
+    }
+    if (componentNames.some(name => name.includes('_'))) {
+      conventions.components.push('snake_case');
     }
 
-    // Add TypeScript types if missing
-    if (module.props_interface && !enhancedCode.includes('interface')) {
-      enhancedCode = `${module.props_interface}\n\n${enhancedCode}`;
+    // Analyze file naming
+    const fileNames = fileDetails.map(f => path.basename(f.path, path.extname(f.path)));
+    if (fileNames.some(name => /^[a-z]/.test(name) && name.includes('.'))){
+      conventions.files.push('camelCase with dots');
+    }
+    if (fileNames.some(name => name.includes('-'))) {
+      conventions.files.push('kebab-case');
     }
 
-    // Ensure proper exports
-    if (!enhancedCode.includes('export')) {
-      if (module.type === 'component') {
-        enhancedCode += `\n\nexport default ${module.name};`;
-      } else {
-        enhancedCode += `\n\nexport { ${module.name} };`;
+    return conventions;
+  }
+
+  private analyzeFolderStructure(fileDetails: any[]): Record<string, string[]> {
+    const structure = {
+      patterns: [] as string[],
+      common_folders: [] as string[]
+    };
+
+    const folders = [...new Set(fileDetails.map(f => path.dirname(f.path)))];
+    
+    // Common folder patterns
+    const commonFolders = ['components', 'pages', 'services', 'utils', 'hooks', 'types', 'styles', 'assets'];
+    structure.common_folders = commonFolders.filter(folder =>
+      folders.some(f => f.includes(folder))
+    );
+
+    // Structure patterns
+    if (folders.some(f => f.includes('src'))) {
+      structure.patterns.push('src/ based structure');
+    }
+    if (folders.some(f => f.includes('app'))) {
+      structure.patterns.push('app/ based structure');
+    }
+    if (folders.some(f => f.includes('feature') || f.includes('module'))) {
+      structure.patterns.push('Feature-based organization');
+    }
+
+    return structure;
+  }
+
+  private async detectStylingApproach(projectPath: string): Promise<string> {
+    try {
+      // Check for common styling files and configurations
+      const packageJsonPath = path.join(projectPath, 'package.json');
+      let packageJson;
+      
+      try {
+        const content = await fs.readFile(packageJsonPath, 'utf-8');
+        packageJson = JSON.parse(content);
+      } catch {
+        return 'unknown';
       }
-    }
 
-    // Add JSDoc comments
-    const jsdocComment = this.generateJSDocComment(module);
-    if (jsdocComment && !enhancedCode.includes('/**')) {
-      enhancedCode = `${jsdocComment}\n${enhancedCode}`;
+      const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
+      
+      if (dependencies['styled-components']) return 'styled-components';
+      if (dependencies['@emotion/react'] || dependencies['@emotion/styled']) return 'emotion';
+      if (dependencies['tailwindcss']) return 'tailwind';
+      if (dependencies['sass'] || dependencies['node-sass']) return 'sass';
+      if (dependencies['less']) return 'less';
+      
+      // Check for CSS modules
+      const hasModuleCSS = await this.checkForFiles(projectPath, '**/*.module.css');
+      if (hasModuleCSS) return 'css-modules';
+      
+      return 'css';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private async detectStateManagement(projectPath: string): Promise<string> {
+    try {
+      const packageJsonPath = path.join(projectPath, 'package.json');
+      const content = await fs.readFile(packageJsonPath, 'utf-8');
+      const packageJson = JSON.parse(content);
+      
+      const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
+      
+      if (dependencies['redux'] || dependencies['@reduxjs/toolkit']) return 'redux';
+      if (dependencies['zustand']) return 'zustand';
+      if (dependencies['recoil']) return 'recoil';
+      if (dependencies['mobx']) return 'mobx';
+      if (dependencies['jotai']) return 'jotai';
+      
+      return 'react-state'; // Default to React built-in state
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private async detectTestingFramework(projectPath: string): Promise<string> {
+    try {
+      const packageJsonPath = path.join(projectPath, 'package.json');
+      const content = await fs.readFile(packageJsonPath, 'utf-8');
+      const packageJson = JSON.parse(content);
+      
+      const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
+      
+      if (dependencies['jest']) return 'jest';
+      if (dependencies['vitest']) return 'vitest';
+      if (dependencies['mocha']) return 'mocha';
+      if (dependencies['@testing-library/react']) return 'testing-library';
+      
+      return 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private async checkForFiles(projectPath: string, pattern: string): Promise<boolean> {
+    try {
+      const { glob } = await import('glob');
+      const matches = await glob(pattern, { cwd: projectPath });
+      return matches.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private async gatherProjectContext(projectId: string, scanResults?: ScanResult): Promise<any> {
+    try {
+      // Get relevant memories and preferences
+      const [patterns, preferences, successes] = await Promise.all([
+        this.memoryManager.getPatterns(projectId, 5),
+        this.memoryManager.getPreferences(projectId),
+        this.memoryManager.getSuccesses(projectId, 3)
+      ]);
+
+      const context = {
+        frameworks: scanResults?.structure_analysis.architecture_patterns || [],
+        patterns: patterns.map(p => p.content),
+        preferences: preferences.map(p => p.content),
+        successes: successes.map(s => s.content),
+        project_info: scanResults ? {
+          file_count: scanResults.structure_analysis.file_count,
+          component_count: scanResults.structure_analysis.component_count,
+          complexity_score: scanResults.structure_analysis.complexity_score
+        } : {}
+      };
+
+      return context;
+    } catch (error) {
+      await this.logger.warn('generator', 'Failed to gather project context', {
+        project_id: projectId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return { frameworks: [], patterns: [], preferences: [], successes: [], project_info: {} };
+    }
+  }
+
+  private async generateAIModules(
+    moduleRequest: string,
+    existingPatterns: any,
+    frameworks: string[],
+    projectContext: any
+  ): Promise<any> {
+    try {
+      // Get AI generation using the specialized generator prompt
+      const aiRequest = AIClient.getGeneratorPrompt(moduleRequest, existingPatterns.component_patterns, frameworks);
+      const aiResponse = await this.aiClient.generateResponse(aiRequest);
+      
+      // Parse the JSON response
+      let generation;
+      try {
+        generation = JSON.parse(aiResponse.content);
+      } catch (parseError) {
+        await this.logger.warn('generator', 'Failed to parse AI response as JSON, using fallback', {
+          response_content: aiResponse.content.substring(0, 500)
+        });
+        
+        // Fallback generation
+        generation = this.createFallbackGeneration(moduleRequest, existingPatterns);
+      }
+
+      return generation;
+    } catch (error) {
+      await this.logger.error('generator', 'AI module generation failed, using fallback', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      
+      return this.createFallbackGeneration(moduleRequest, existingPatterns);
+    }
+  }
+
+  private createFallbackGeneration(moduleRequest: string, existingPatterns: any): any {
+    const modules: GeneratedModule[] = [];
+    
+    // Parse request to determine module type
+    const isComponent = moduleRequest.toLowerCase().includes('component') || 
+                       moduleRequest.toLowerCase().includes('ui') ||
+                       moduleRequest.toLowerCase().includes('button') ||
+                       moduleRequest.toLowerCase().includes('form');
+    
+    const isService = moduleRequest.toLowerCase().includes('service') ||
+                     moduleRequest.toLowerCase().includes('api') ||
+                     moduleRequest.toLowerCase().includes('client');
+    
+    const isUtility = moduleRequest.toLowerCase().includes('utility') ||
+                     moduleRequest.toLowerCase().includes('helper') ||
+                     moduleRequest.toLowerCase().includes('utils');
+
+    if (isComponent) {
+      modules.push(this.generateBasicComponent(moduleRequest, existingPatterns));
+    } else if (isService) {
+      modules.push(this.generateBasicService(moduleRequest, existingPatterns));
+    } else if (isUtility) {
+      modules.push(this.generateBasicUtility(moduleRequest, existingPatterns));
+    } else {
+      // Default to component
+      modules.push(this.generateBasicComponent(moduleRequest, existingPatterns));
     }
 
     return {
-      ...module,
-      code: enhancedCode
+      generated_modules: modules,
+      integration_instructions: [`Import and use the generated ${modules[0].type}`],
+      testing_suggestions: [`Write unit tests for ${modules[0].name}`]
     };
   }
 
-  private generateJSDocComment(module: GeneratedModule): string {
-    return `/**
- * ${module.name}
- * 
- * Generated module of type: ${module.type}
- * 
- * @description Auto-generated by Claude Agent System
- */`;
-  }
-
-  private validateModuleSyntax(module: GeneratedModule): boolean {
-    const code = module.code;
-
-    // Basic syntax checks
-    const openBraces = (code.match(/{/g) || []).length;
-    const closeBraces = (code.match(/}/g) || []).length;
+  private generateBasicComponent(request: string, patterns: any): GeneratedModule {
+    const componentName = this.extractComponentName(request) || 'CustomComponent';
+    const usesTypeScript = patterns.frameworks.includes('TypeScript');
+    const extension = usesTypeScript ? 'tsx' : 'jsx';
     
-    if (openBraces !== closeBraces) {
-      return false;
-    }
+    const code = `import React${usesTypeScript ? ', { FC }' : ''} from 'react';
+${usesTypeScript ? `
+interface ${componentName}Props {
+  className?: string;
+  children?: React.ReactNode;
+}
+` : ''}
+${usesTypeScript ? `const ${componentName}: FC<${componentName}Props> = ({ className, children, ...props })` : `const ${componentName} = ({ className, children, ...props })`} => {
+  return (
+    <div className={\`${componentName.toLowerCase()}\${className ? \` \${className}\` : ''}\`} {...props}>
+      {children || 'Generated ${componentName}'}
+    </div>
+  );
+};
 
-    // Check for required elements based on type
-    switch (module.type) {
-      case 'component':
-        return code.includes('return') || code.includes('=>');
-      case 'service':
-        return code.includes('function') || code.includes('=>') || code.includes('class');
-      case 'utility':
-        return code.includes('function') || code.includes('=>') || code.includes('export');
-      case 'hook':
-        return code.includes('use') && (code.includes('function') || code.includes('=>'));
-      default:
-        return true;
-    }
+export default ${componentName};`;
+
+    return {
+      name: componentName,
+      type: 'component',
+      file_path: `src/components/${componentName}.${extension}`,
+      code,
+      dependencies: ['react'],
+      props_interface: usesTypeScript ? `${componentName}Props` : undefined,
+      usage_example: `<${componentName} className="custom-class">Content</${componentName}>`,
+      tests: this.generateComponentTest(componentName, usesTypeScript)
+    };
   }
 
-  private async createIntegrationInstructions(
+  private generateBasicService(request: string, patterns: any): GeneratedModule {
+    const serviceName = this.extractServiceName(request) || 'CustomService';
+    const usesTypeScript = patterns.frameworks.includes('TypeScript');
+    const extension = usesTypeScript ? 'ts' : 'js';
+    
+    const code = `${usesTypeScript ? `
+interface ${serviceName}Config {
+  baseUrl?: string;
+  timeout?: number;
+}
+
+interface ${serviceName}Response<T = any> {
+  data: T;
+  status: number;
+  message?: string;
+}
+` : ''}
+class ${serviceName} {
+  ${usesTypeScript ? 'private ' : ''}config${usesTypeScript ? ': ' + serviceName + 'Config' : ''};
+
+  constructor(config${usesTypeScript ? ': ' + serviceName + 'Config' : ''} = {}) {
+    this.config = {
+      baseUrl: '/api',
+      timeout: 5000,
+      ...config
+    };
+  }
+
+  async getData(endpoint${usesTypeScript ? ': string' : ''})${usesTypeScript ? ': Promise<' + serviceName + 'Response>' : ''} {
+    try {
+      const response = await fetch(\`\${this.config.baseUrl}\${endpoint}\`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(\`HTTP error! status: \${response.status}\`);
+      }
+
+      const data = await response.json();
+      return {
+        data,
+        status: response.status,
+        message: 'Success'
+      };
+    } catch (error) {
+      throw new Error(\`${serviceName} error: \${error${usesTypeScript ? ' instanceof Error ? error.message : String(error)' : ''}}\`);
+    }
+  }
+}
+
+export default ${serviceName};
+export { ${serviceName} };`;
+
+    return {
+      name: serviceName,
+      type: 'service',
+      file_path: `src/services/${serviceName}.${extension}`,
+      code,
+      dependencies: [],
+      usage_example: `const service = new ${serviceName}();\nconst data = await service.getData('/endpoint');`,
+      tests: this.generateServiceTest(serviceName, usesTypeScript)
+    };
+  }
+
+  private generateBasicUtility(request: string, patterns: any): GeneratedModule {
+    const utilityName = this.extractUtilityName(request) || 'customUtility';
+    const usesTypeScript = patterns.frameworks.includes('TypeScript');
+    const extension = usesTypeScript ? 'ts' : 'js';
+    
+    const code = `/**
+ * ${utilityName} - Generated utility function
+ * ${request}
+ */
+
+${usesTypeScript ? `
+export interface ${utilityName}Options {
+  [key: string]: any;
+}
+` : ''}
+export const ${utilityName} = (input${usesTypeScript ? ': any' : ''}, options${usesTypeScript ? ': ' + utilityName + 'Options' : ''} = {})${usesTypeScript ? ': any' : ''} => {
+  // TODO: Implement ${utilityName} logic based on requirements
+  console.log('${utilityName} called with:', input, options);
+  
+  return input;
+};
+
+// Helper function
+export const validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)} = (value${usesTypeScript ? ': any' : ''})${usesTypeScript ? ': boolean' : ''} => {
+  // TODO: Add validation logic
+  return value != null;
+};
+
+export default {
+  ${utilityName},
+  validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)}
+};`;
+
+    return {
+      name: utilityName,
+      type: 'utility',
+      file_path: `src/utils/${utilityName}.${extension}`,
+      code,
+      dependencies: [],
+      usage_example: `import { ${utilityName} } from './utils/${utilityName}';\nconst result = ${utilityName}(data, options);`,
+      tests: this.generateUtilityTest(utilityName, usesTypeScript)
+    };
+  }
+
+  private extractComponentName(request: string): string {
+    // Extract component name from request
+    const words = request.split(/\s+/);
+    const componentWords = words.filter(word => 
+      word.length > 2 && 
+      !['create', 'generate', 'build', 'make', 'component', 'for', 'the', 'a', 'an'].includes(word.toLowerCase())
+    );
+    
+    if (componentWords.length > 0) {
+      return componentWords.map(word => 
+        word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+      ).join('');
+    }
+    
+    return 'CustomComponent';
+  }
+
+  private extractServiceName(request: string): string {
+    const words = request.split(/\s+/);
+    const serviceWords = words.filter(word => 
+      word.length > 2 && 
+      !['create', 'generate', 'build', 'make', 'service', 'for', 'the', 'a', 'an'].includes(word.toLowerCase())
+    );
+    
+    if (serviceWords.length > 0) {
+      return serviceWords.map(word => 
+        word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+      ).join('') + 'Service';
+    }
+    
+    return 'CustomService';
+  }
+
+  private extractUtilityName(request: string): string {
+    const words = request.split(/\s+/);
+    const utilityWords = words.filter(word => 
+      word.length > 2 && 
+      !['create', 'generate', 'build', 'make', 'utility', 'helper', 'for', 'the', 'a', 'an'].includes(word.toLowerCase())
+    );
+    
+    if (utilityWords.length > 0) {
+      const baseName = utilityWords.map((word, index) => 
+        index === 0 ? word.toLowerCase() : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+      ).join('');
+      return baseName;
+    }
+    
+    return 'customUtility';
+  }
+
+  private generateComponentTest(componentName: string, usesTypeScript: boolean): string {
+    const extension = usesTypeScript ? 'tsx' : 'jsx';
+    
+    return `import React from 'react';
+import { render, screen } from '@testing-library/react';
+import ${componentName} from './${componentName}';
+
+describe('${componentName}', () => {
+  it('renders without crashing', () => {
+    render(<${componentName} />);
+    expect(screen.getByText(/Generated ${componentName}/i)).toBeInTheDocument();
+  });
+
+  it('applies custom className', () => {
+    const customClass = 'test-class';
+    render(<${componentName} className={customClass} />);
+    const element = screen.getByText(/Generated ${componentName}/i);
+    expect(element).toHaveClass(customClass);
+  });
+
+  it('renders children when provided', () => {
+    const childText = 'Custom child content';
+    render(<${componentName}>{childText}</${componentName}>);
+    expect(screen.getByText(childText)).toBeInTheDocument();
+  });
+});`;
+  }
+
+  private generateServiceTest(serviceName: string, usesTypeScript: boolean): string {
+    return `import ${serviceName} from './${serviceName}';
+
+// Mock fetch
+global.fetch = jest.fn();
+
+describe('${serviceName}', () => {
+  let service${usesTypeScript ? ': ' + serviceName : ''};
+
+  beforeEach(() => {
+    service = new ${serviceName}();
+    (fetch as jest.MockedFunction<typeof fetch>).mockClear();
+  });
+
+  it('creates instance with default config', () => {
+    expect(service).toBeInstanceOf(${serviceName});
+  });
+
+  it('fetches data successfully', async () => {
+    const mockData = { id: 1, name: 'Test' };
+    (fetch as jest.MockedFunction<typeof fetch>).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => mockData,
+    } as Response);
+
+    const result = await service.getData('/test');
+    
+    expect(result.status).toBe(200);
+    expect(result.data).toEqual(mockData);
+    expect(fetch).toHaveBeenCalledWith('/api/test', expect.any(Object));
+  });
+
+  it('handles fetch errors', async () => {
+    (fetch as jest.MockedFunction<typeof fetch>).mockRejectedValueOnce(new Error('Network error'));
+
+    await expect(service.getData('/test')).rejects.toThrow('${serviceName} error');
+  });
+});`;
+  }
+
+  private generateUtilityTest(utilityName: string, usesTypeScript: boolean): string {
+    return `import { ${utilityName}, validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)} } from './${utilityName}';
+
+describe('${utilityName}', () => {
+  it('processes input correctly', () => {
+    const testInput = 'test data';
+    const result = ${utilityName}(testInput);
+    
+    expect(result).toBe(testInput);
+  });
+
+  it('accepts options parameter', () => {
+    const testInput = 'test data';
+    const options = { flag: true };
+    
+    expect(() => ${utilityName}(testInput, options)).not.toThrow();
+  });
+});
+
+describe('validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)}', () => {
+  it('validates truthy values', () => {
+    expect(validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)}('test')).toBe(true);
+    expect(validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)}(123)).toBe(true);
+  });
+
+  it('invalidates falsy values', () => {
+    expect(validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)}(null)).toBe(false);
+    expect(validate${utilityName.charAt(0).toUpperCase() + utilityName.slice(1)}(undefined)).toBe(false);
+  });
+});`;
+  }
+
+  private async enhanceGeneratedModules(
     modules: GeneratedModule[],
-    projectStructure: any
-  ): Promise<string[]> {
+    existingPatterns: any,
+    projectPath: string
+  ): Promise<GeneratedModule[]> {
+    const enhanced: GeneratedModule[] = [];
+
+    for (const module of modules) {
+      try {
+        const enhancedModule = { ...module };
+
+        // Apply consistent naming conventions
+        if (existingPatterns.naming_conventions.components?.includes('PascalCase') && module.type === 'component') {
+          enhancedModule.name = this.toPascalCase(module.name);
+        }
+
+        // Apply consistent styling approach
+        if (existingPatterns.styling_approach !== 'unknown') {
+          enhancedModule.code = this.applyStylingPattern(module.code, existingPatterns.styling_approach);
+        }
+
+        // Add consistent imports based on project patterns
+        enhancedModule.code = this.addConsistentImports(module.code, existingPatterns);
+
+        // Ensure proper file path based on folder structure
+        enhancedModule.file_path = this.adjustFilePath(module.file_path, existingPatterns.folder_structure);
+
+        enhanced.push(enhancedModule);
+      } catch (error) {
+        await this.logger.warn('generator', `Failed to enhance module: ${module.name}`, {
+          error: error instanceof Error ? error.message : String(error)
+        });
+        enhanced.push(module); // Use original if enhancement fails
+      }
+    }
+
+    return enhanced;
+  }
+
+  private toPascalCase(str: string): string {
+    return str.replace(/(?:^|[-_\s])(\w)/g, (match, letter) => letter.toUpperCase());
+  }
+
+  private applyStylingPattern(code: string, stylingApproach: string): string {
+    switch (stylingApproach) {
+      case 'styled-components':
+        if (code.includes('className=')) {
+          return code.replace(
+            /className={\`([^`]+)\`}/g,
+            'styled.div`\n  /* Add styles here */\n`'
+          );
+        }
+        break;
+      
+      case 'tailwind':
+        if (code.includes('className=')) {
+          return code.replace(
+            /className={\`([^`]+)\`}/g,
+            'className="flex items-center justify-center p-4 bg-white rounded-lg shadow"'
+          );
+        }
+        break;
+        
+      case 'css-modules':
+        return code.replace(
+          /className={\`([^`]+)\`}/g,
+          'className={styles.$1}'
+        );
+    }
+    
+    return code;
+  }
+
+  private addConsistentImports(code: string, patterns: any): string {
+    let enhancedCode = code;
+
+    // Add consistent React imports based on patterns
+    if (patterns.frameworks.includes('React') && !code.includes('import React')) {
+      enhancedCode = `import React from 'react';\n${enhancedCode}`;
+    }
+
+    return enhancedCode;
+  }
+
+  private adjustFilePath(filePath: string, folderStructure: any): string {
+    // Adjust file path based on existing folder structure
+    if (folderStructure.patterns?.includes('src/ based structure')) {
+      if (!filePath.startsWith('src/')) {
+        return `src/${filePath}`;
+      }
+    }
+
+    return filePath;
+  }
+
+  private createIntegrationInstructions(
+    modules: GeneratedModule[],
+    patterns: any,
+    projectPath: string
+  ): string[] {
     const instructions: string[] = [];
 
-    // General setup instructions
-    instructions.push('Integration Instructions:');
+    instructions.push('## Integration Instructions');
     instructions.push('');
 
-    // File creation instructions
-    instructions.push('1. File Creation:');
-    modules.forEach(module => {
-      instructions.push(`   - Create ${module.file_path} with the provided code`);
-    });
-    instructions.push('');
-
-    // Dependency instructions
-    const allDependencies = [...new Set(modules.flatMap(m => m.dependencies))];
-    if (allDependencies.length > 0) {
-      instructions.push('2. Install Dependencies:');
-      instructions.push(`   npm install ${allDependencies.join(' ')}`);
-      instructions.push('');
-    }
-
-    // Import instructions
-    instructions.push('3. Usage Examples:');
-    modules.forEach(module => {
-      if (module.usage_example) {
-        instructions.push(`   ${module.name}:`);
-        instructions.push(`   ${module.usage_example}`);
-        instructions.push('');
+    for (const module of modules) {
+      instructions.push(`### ${module.name} (${module.type})`);
+      instructions.push(`1. Save the generated code to: \`${module.file_path}\``);
+      
+      if (module.dependencies.length > 0) {
+        instructions.push(`2. Install dependencies: \`npm install ${module.dependencies.join(' ')}\``);
       }
-    });
-
-    // Framework-specific instructions
-    if (projectStructure.frameworks.includes('React')) {
-      instructions.push('4. React Integration:');
-      instructions.push('   - Import components into your App.js or routing configuration');
-      instructions.push('   - For hooks, import and use within functional components');
+      
+      instructions.push(`3. Import and use:`);
+      instructions.push(`   \`\`\`${module.file_path.endsWith('.tsx') ? 'tsx' : module.file_path.endsWith('.ts') ? 'ts' : 'js'}`);
+      instructions.push(`   ${module.usage_example}`);
+      instructions.push(`   \`\`\``);
+      
+      if (module.props_interface) {
+        instructions.push(`4. TypeScript interface: \`${module.props_interface}\``);
+      }
+      
       instructions.push('');
     }
 
-    // TypeScript instructions
-    if (projectStructure.frameworks.includes('TypeScript')) {
-      instructions.push('5. TypeScript Setup:');
-      instructions.push('   - Ensure all generated interfaces are exported');
-      instructions.push('   - Update your tsconfig.json if new paths are added');
-      instructions.push('');
+    // Add general integration notes
+    instructions.push('## General Notes');
+    instructions.push('- Ensure all imports are correctly resolved');
+    instructions.push('- Run type checking if using TypeScript');
+    instructions.push('- Add appropriate styling to match your design system');
+    instructions.push('- Consider adding error boundaries for React components');
+
+    if (patterns.testing_framework !== 'unknown') {
+      instructions.push(`- Run tests using your ${patterns.testing_framework} setup`);
     }
 
     return instructions;
   }
 
-  private async createTestingSuggestions(modules: GeneratedModule[]): Promise<string[]> {
+  private createTestingSuggestions(modules: GeneratedModule[], patterns: any): string[] {
     const suggestions: string[] = [];
 
-    suggestions.push('Testing Suggestions:');
+    suggestions.push('## Testing Suggestions');
     suggestions.push('');
 
-    modules.forEach(module => {
-      suggestions.push(`${module.name} (${module.type}):`);
+    for (const module of modules) {
+      suggestions.push(`### ${module.name}`);
       
       switch (module.type) {
         case 'component':
-          suggestions.push('  - Test rendering with different props');
-          suggestions.push('  - Test user interactions (clicks, input changes)');
-          suggestions.push('  - Test accessibility with screen readers');
-          suggestions.push('  - Snapshot testing for visual regression');
+          suggestions.push('- Test rendering without props');
+          suggestions.push('- Test with different prop combinations');
+          suggestions.push('- Test user interactions (clicks, inputs, etc.)');
+          suggestions.push('- Test accessibility features');
+          suggestions.push('- Test responsive behavior');
           break;
-
+          
         case 'service':
-          suggestions.push('  - Test all public methods');
-          suggestions.push('  - Mock external dependencies');
-          suggestions.push('  - Test error handling scenarios');
-          suggestions.push('  - Test async operations');
+          suggestions.push('- Mock external dependencies');
+          suggestions.push('- Test successful API calls');
+          suggestions.push('- Test error handling scenarios');
+          suggestions.push('- Test different input parameters');
+          suggestions.push('- Test timeout and retry logic');
           break;
-
+          
         case 'utility':
-          suggestions.push('  - Test with various input types');
-          suggestions.push('  - Test edge cases and boundary conditions');
-          suggestions.push('  - Test error cases with invalid inputs');
-          suggestions.push('  - Performance testing for complex operations');
-          break;
-
-        case 'hook':
-          suggestions.push('  - Test hook behavior with different inputs');
-          suggestions.push('  - Test state changes and side effects');
-          suggestions.push('  - Test cleanup and unmounting');
-          suggestions.push('  - Test with React Testing Library');
+          suggestions.push('- Test with various input types');
+          suggestions.push('- Test edge cases (null, undefined, empty)');
+          suggestions.push('- Test error conditions');
+          suggestions.push('- Test performance with large datasets');
           break;
       }
-
+      
       if (module.tests) {
-        suggestions.push('  Generated test template:');
-        suggestions.push(`  ${module.tests}`);
+        suggestions.push(`- Generated test file: \`${module.file_path.replace(/\.(tsx?|jsx?)$/, '.test.$1')}\``);
       }
-
+      
       suggestions.push('');
-    });
+    }
+
+    // Add framework-specific suggestions
+    if (patterns.testing_framework === 'jest') {
+      suggestions.push('## Jest-specific suggestions');
+      suggestions.push('- Use `describe` blocks to group related tests');
+      suggestions.push('- Use `beforeEach` and `afterEach` for setup/cleanup');
+      suggestions.push('- Mock external dependencies with `jest.mock()`');
+    }
+
+    if (patterns.frameworks.includes('React')) {
+      suggestions.push('## React Testing suggestions');
+      suggestions.push('- Use React Testing Library for component tests');
+      suggestions.push('- Test user behavior, not implementation details');
+      suggestions.push('- Use `screen.getByRole()` for accessibility-friendly queries');
+    }
 
     return suggestions;
   }
 
   private async storeGenerationInsights(
     projectId: string,
-    generationResult: ModuleGenerationResult,
+    modules: GeneratedModule[],
     moduleRequest: string
   ): Promise<void> {
     try {
-      // Store overall generation insight
+      // Store generation insights
       await this.memoryManager.storeInsight(
         projectId,
-        `Module generation completed: ${generationResult.generated_modules.length} modules created`,
+        `Module generation completed: ${modules.length} modules created`,
         {
-          modules_count: generationResult.generated_modules.length,
-          request: moduleRequest,
-          module_types: generationResult.generated_modules.map(m => m.type),
-          integration_steps: generationResult.integration_instructions.length
+          module_count: modules.length,
+          module_types: [...new Set(modules.map(m => m.type))],
+          original_request: moduleRequest,
+          generated_modules: modules.map(m => ({ name: m.name, type: m.type, file_path: m.file_path }))
         },
-        8 // High importance
+        6
       );
 
       // Store successful generation patterns
-      const moduleTypes = generationResult.generated_modules.map(m => m.type);
-      const typeFrequency: Record<string, number> = {};
-
-      moduleTypes.forEach(type => {
-        typeFrequency[type] = (typeFrequency[type] || 0) + 1;
-      });
-
-      for (const [type, count] of Object.entries(typeFrequency)) {
-        await this.memoryManager.storePattern(
+      for (const module of modules) {
+        await this.memoryManager.storeSuccess(
           projectId,
-          `Generated ${type} modules`,
-          [`Count: ${count}`, `Request: ${moduleRequest}`],
-          count,
-          6
-        );
-      }
-
-      // Store successful generation as success memory
-      await this.memoryManager.storeSuccess(
-        projectId,
-        `Module generation: ${moduleRequest}`,
-        `Successfully generated ${generationResult.generated_modules.length} modules`,
-        {
-          modules_count: generationResult.generated_modules.length,
-          types_generated: moduleTypes,
-          has_tests: generationResult.generated_modules.some(m => m.tests),
-          has_interfaces: generationResult.generated_modules.some(m => m.props_interface)
-        },
-        7
-      );
-
-      // Store preferences based on generated modules
-      const hasTypeScript = generationResult.generated_modules.some(m => 
-        m.code.includes('interface') || m.code.includes('type ')
-      );
-      
-      if (hasTypeScript) {
-        await this.memoryManager.storePreference(
-          projectId,
-          'uses_typescript',
-          true,
-          'Generated modules use TypeScript types and interfaces',
-          6
-        );
-      }
-
-      const hasTests = generationResult.generated_modules.some(m => m.tests);
-      if (hasTests) {
-        await this.memoryManager.storePreference(
-          projectId,
-          'includes_tests',
-          true,
-          'Generated modules include test templates',
+          `Generated ${module.type}: ${module.name}`,
+          `Successfully created ${module.type} module based on request`,
+          {
+            module_type: module.type as any,
+            dependencies_count: module.dependencies.length,
+            has_tests: !!module.tests ? 1 : 0
+          },
           5
         );
       }
+
+      await this.logger.debug('generator', 'Generation insights stored in memory', {
+        project_id: projectId,
+        insights_stored: 1 + modules.length
+      });
 
     } catch (error) {
       await this.logger.warn('generator', 'Failed to store generation insights', {
@@ -747,67 +982,5 @@ export class GeneratorAgent {
         error: error instanceof Error ? error.message : String(error)
       });
     }
-  }
-
-  // Utility method to actually create the files (for future use)
-  async createModuleFiles(
-    modules: GeneratedModule[],
-    targetDirectory: string,
-    options: { dryRun?: boolean; overwrite?: boolean } = {}
-  ): Promise<{ created: number; skipped: number; errors: string[] }> {
-    const result = {
-      created: 0,
-      skipped: 0,
-      errors: [] as string[]
-    };
-
-    for (const module of modules) {
-      try {
-        const fullPath = path.join(targetDirectory, module.file_path);
-        const dir = path.dirname(fullPath);
-
-        if (!options.dryRun) {
-          // Ensure directory exists
-          await fs.mkdir(dir, { recursive: true });
-
-          // Check if file already exists
-          try {
-            await fs.access(fullPath);
-            if (!options.overwrite) {
-              result.skipped++;
-              await this.logger.info('generator', `Skipped existing file: ${module.file_path}`);
-              continue;
-            }
-          } catch {
-            // File doesn't exist, proceed with creation
-          }
-
-          // Write the file
-          await fs.writeFile(fullPath, module.code, 'utf-8');
-          result.created++;
-          
-          await this.logger.info('generator', `Created module file: ${module.file_path}`, {
-            module_name: module.name,
-            module_type: module.type
-          });
-        } else {
-          // Dry run - just validate the path
-          result.created++;
-          await this.logger.info('generator', `Would create: ${module.file_path} (dry run)`);
-        }
-
-      } catch (error) {
-        const errorMsg = `Failed to create ${module.file_path}: ${error instanceof Error ? error.message : String(error)}`;
-        result.errors.push(errorMsg);
-        
-        await this.logger.error('generator', 'Failed to create module file', {
-          module_name: module.name,
-          file_path: module.file_path,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
-    }
-
-    return result;
   }
 }

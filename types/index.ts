@@ -16,6 +16,8 @@ export interface AgentOptions {
   timeoutMs?: number;
   retryAttempts?: number;
   verboseLogging?: boolean;
+  targetFiles?: string[];
+  excludePatterns?: string[];
 }
 
 // Task Management
@@ -32,6 +34,7 @@ export interface Task {
   completed_at?: string;
   parent_task_id?: string;
   metadata: TaskMetadata;
+  created_at?: string;
 }
 
 export interface TaskMetadata {
@@ -255,3 +258,72 @@ export interface ProjectStats {
   total_cost: number;
   avg_completion_time_ms: number;
 }
+
+// File Analysis Types
+export interface FileAnalysis {
+  path: string;
+  type: 'component' | 'service' | 'utility' | 'config' | 'test' | 'other';
+  language: 'typescript' | 'javascript' | 'tsx' | 'jsx' | 'json' | 'css' | 'html' | 'other';
+  size_bytes: number;
+  lines_of_code: number;
+  imports: string[];
+  exports: string[];
+  functions: FunctionInfo[];
+  components?: ComponentInfo[];
+  complexity_score: number;
+}
+
+export interface FunctionInfo {
+  name: string;
+  line_number: number;
+  parameters: string[];
+  return_type?: string;
+  complexity: number;
+}
+
+export interface ComponentInfo {
+  name: string;
+  line_number: number;
+  props?: string[];
+  hooks_used: string[];
+  lifecycle_methods?: string[];
+}
+
+// API Response Types
+export interface APIResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  message?: string;
+}
+
+export interface AgentStatus {
+  agent_type: AgentType;
+  status: TaskStatus;
+  current_task?: string;
+  progress?: number;
+  last_activity: string;
+}
+
+export interface SystemHealth {
+  status: 'healthy' | 'warning' | 'error';
+  uptime: number;
+  memory_usage: number;
+  active_tasks: number;
+  database_connected: boolean;
+  ai_service_connected: boolean;
+  last_check: string;
+}
+
+// Event Types for Real-time Updates
+export interface AgentEvent {
+  type: 'task_started' | 'task_completed' | 'task_failed' | 'log_entry' | 'progress_update';
+  timestamp: string;
+  data: Record<string, any>;
+}
+
+// Utility Types
+export type Optional<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
+export type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = Pick<T, Exclude<keyof T, Keys>> & {
+  [K in Keys]-?: Required<Pick<T, K>> & Partial<Pick<T, Exclude<Keys, K>>>;
+}[Keys];

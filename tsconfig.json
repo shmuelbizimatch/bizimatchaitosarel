@@ -15,21 +15,26 @@
     "resolveJsonModule": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
+    "jsx": "react-jsx",
+    "allowSyntheticDefaultImports": true,
     "baseUrl": ".",
     "paths": {
       "@/*": ["./*"],
       "@agent-core/*": ["./agent-core/*"],
-      "@frontend/*": ["./frontend/*"]
+      "@frontend/*": ["./frontend/*"],
+      "@api/*": ["./api/*"]
     }
   },
   "include": [
     "agent-core/**/*",
-    "frontend/**/*",
-    "types/**/*"
+    "api/**/*",
+    "types/**/*",
+    "setup/**/*"
   ],
   "exclude": [
     "node_modules",
     "dist",
+    "frontend",
     "**/*.test.ts",
     "**/*.spec.ts"
   ]

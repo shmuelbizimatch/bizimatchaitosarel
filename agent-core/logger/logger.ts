@@ -72,8 +72,8 @@ This logbook tracks all activities of the autonomous agent system. Each session 
       timestamp: new Date().toISOString(),
       level,
       agent_type: agentType,
-      task_id: this.taskId,
-      project_id: this.projectId,
+      task_id: this.taskId || undefined,
+      project_id: this.projectId || undefined,
       message: data.message,
       data: data.data,
       error_stack: data.error_stack
