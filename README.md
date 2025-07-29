@@ -27,9 +27,9 @@ A comprehensive autonomous AI agent system optimized for Claude 3.5 Sonnet with 
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Node.js 18+ and npm
-- Anthropic API key ([Get one here](https://console.anthropic.com/))
-- Supabase project ([Create one here](https://supabase.com/))
+- **Node.js 18+** and npm ([Download here](https://nodejs.org/))
+- **Anthropic API key** ([Get one here](https://console.anthropic.com/))
+- **Supabase project** ([Create one here](https://supabase.com/))
 
 ### Installation
 
@@ -43,31 +43,71 @@ A comprehensive autonomous AI agent system optimized for Claude 3.5 Sonnet with 
 
 2. **Configure Environment**
    ```bash
+   # Copy the example environment file
    cp .env.example .env
-   # Edit .env with your API keys:
-   # - ANTHROPIC_API_KEY=your_claude_api_key
-   # - SUPABASE_URL=your_supabase_url
-   # - SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+   
+   # Edit .env with your actual credentials:
+   # ANTHROPIC_API_KEY=your_actual_claude_api_key
+   # SUPABASE_URL=https://your-project-id.supabase.co
+   # SUPABASE_SERVICE_ROLE_KEY=your_actual_service_role_key
    ```
 
-3. **Build and Setup Database**
+3. **Verify Setup**
    ```bash
-   npm run build
-   npm run setup-db
+   # Check if all prerequisites are met
+   npm run check
    ```
 
-4. **Start the System**
+4. **Build and Setup Database**
+   ```bash
+   # This will check prerequisites, build, and setup database
+   npm run setup
+   ```
+
+5. **Start the System**
    ```bash
    # Terminal 1: Start API server
    npm run api
 
-   # Terminal 2: Start frontend
+   # Terminal 2: Start frontend  
    npm run frontend
    ```
 
-5. **Access the Interface**
+6. **Access the Interface**
    - Frontend: http://localhost:3000
    - API Health: http://localhost:3001/api/health
+
+### Troubleshooting
+
+#### Common Issues
+
+**"Prerequisites check FAILED"**
+- Run `npm run check` to see specific issues
+- Ensure all environment variables are set with real values (not placeholders)
+- Verify Node.js version is 18+
+
+**"Database setup failed: TypeError: fetch failed"**
+- Check your Supabase URL and service role key are correct
+- Verify your Supabase project is active and accessible
+- Ensure you're using the service role key (not anon key)
+- See [Manual Setup Guide](setup/manual-setup.md) for alternative setup
+
+**"API server not starting"**
+- Verify environment variables are configured: `npm run check`
+- Check if port 3001 is already in use: `lsof -i :3001`
+- Look for detailed error messages in the console
+
+**"Frontend can't connect to API"**
+- Ensure API server is running on port 3001
+- Check that CORS is configured properly
+- Verify frontend proxy setting in `frontend/package.json`
+
+#### Getting Help
+
+1. **Run diagnostics**: `npm run check`
+2. **Check logs**: Look for detailed error messages in console output
+3. **Verify environment**: Ensure all `.env` variables are set correctly
+4. **Database connectivity**: Test your Supabase connection independently
 
 ## 📋 Usage
 
@@ -219,6 +259,22 @@ npm run dev           # Start backend in dev mode
 npm run api           # Start API server
 npm run frontend      # Start React dev server
 ```
+
+### Quick Start (Development Only)
+If you want to test the frontend without full backend setup:
+
+```bash
+# 1. Install dependencies
+npm install && cd frontend && npm install && cd ..
+
+# 2. Build the project
+npm run build
+
+# 3. Start frontend only (some features won't work)
+npm run frontend
+```
+
+**Note**: Without proper environment configuration, the API server won't start and some features will be unavailable.
 
 ## 🔍 Monitoring & Debugging
 

@@ -14,11 +14,30 @@ async function setupDatabase() {
     throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required');
   }
 
+  // Check for placeholder values
+  if (supabaseUrl.includes('your-') || supabaseKey.includes('your_')) {
+    throw new Error('Please replace placeholder values in .env file with your actual Supabase credentials');
+  }
+
   console.log('🚀 Setting up Claude Agent System database...');
+  console.log(`📍 Connecting to: ${supabaseUrl}`);
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
+    // First, test basic connectivity
+    console.log('🔍 Testing database connection...');
+    const { data: testData, error: testError } = await supabase
+      .from('information_schema.tables')
+      .select('count', { count: 'exact' })
+      .limit(1);
+    
+    if (testError) {
+      throw new Error(`Database connection failed: ${testError.message}\n\nPlease verify:\n- Supabase URL is correct\n- Service role key is valid\n- Project is active`);
+    }
+    
+    console.log('✅ Database connection successful');
+
     // Read the schema file
     const schemaPath = path.join(__dirname, '..', 'supabase', 'schema.sql');
     const schema = await fs.readFile(schemaPath, 'utf-8');
@@ -35,6 +54,8 @@ async function setupDatabase() {
     console.log(`📝 Found ${statements.length} SQL statements to execute`);
 
     // Execute each statement
+    console.log('⚠️  Note: If you see errors about missing functions or tables, that\'s normal for initial setup');
+    
     for (let i = 0; i < statements.length; i++) {
       const statement = statements[i];
       if (statement.trim() === 'COMMIT;') continue;
@@ -42,7 +63,15 @@ async function setupDatabase() {
       try {
         const { error } = await supabase.rpc('exec_sql', { sql: statement });
         if (error) {
-          console.log(`⚠️  Statement ${i + 1} had a non-critical error:`, error.message);
+          // Check if it's a "function does not exist" error for exec_sql
+          if (error.message.includes('function exec_sql') || error.message.includes('does not exist')) {
+            console.log(`⚠️  exec_sql function not available - skipping SQL execution`);
+            console.log(`📝 Please run the SQL statements manually in your Supabase SQL editor:`);
+            console.log(`   ${supabaseUrl.replace('https://', 'https://supabase.com/dashboard/project/').replace('.supabase.co', '')}/sql`);
+            break;
+          } else {
+            console.log(`⚠️  Statement ${i + 1} had a non-critical error:`, error.message);
+          }
         } else {
           console.log(`✅ Statement ${i + 1} executed successfully`);
         }
