@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=true
+      - DATABASE_URL=postgresql://user:password@db:5432/bizimatchaitosarel
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./src:/app/src
+      - ./.env:/app/.env
+    command: python src/main.py
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: bizimatchaitosarel
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  worker:
+    build: .
+    command: celery -A src.core.tasks worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/bizimatchaitosarel
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./src:/app/src
+      - ./.env:/app/.env
+
+volumes:
+  postgres_data:
+  redis_data:
