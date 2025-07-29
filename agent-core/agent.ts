@@ -1,54 +1,37 @@
-import { AgentConfig, Task, ExecutionMode, AgentProgress, Project, AgentType } from '../types';
-import { Logger } from './logger/logger';
-import { MemoryManager } from './memory/memoryManager';
-import { TaskManager } from './tasks/taskManager';
-import { AIClient } from './engines/AIClient';
-import { ScannerAgent } from './scanner/scannerAgent';
-import { ImproverAgent } from './improver/improverAgent';
-import { GeneratorAgent } from './generator/generatorAgent';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { promises as fs } from 'fs';
+import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
-import * as dotenv from 'dotenv';
-
-// Load environment variables
-dotenv.config();
+import { AgentConfig, Task, Project, ScanResult, EnhancementResult, ModuleGenerationResult } from '../types';
+import { Logger } from './logger/logger';
+import { AIClient } from './engines/AIClient';
+import { TaskManager } from './tasks/taskManager';
+import { MemoryManager } from './memory/memoryManager';
+import { ScannerAgent } from './agents/scanner';
+import { ImproverAgent } from './agents/improver';
+import { GeneratorAgent } from './agents/generator';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 export class ClaudeAgentSystem {
   private logger: Logger;
-  private memoryManager: MemoryManager;
-  private taskManager: TaskManager;
   private aiClient: AIClient;
+  private taskManager: TaskManager;
+  private memoryManager: MemoryManager;
   private scannerAgent: ScannerAgent;
   private improverAgent: ImproverAgent;
   private generatorAgent: GeneratorAgent;
   private supabase: SupabaseClient;
-  
-  private currentProject: Project | null = null;
-  private isRunning: boolean = false;
-  private currentProgress: AgentProgress = {
-    overall_progress: 0,
-    current_stage: 'Initializing',
-    stages_completed: [],
-    estimated_completion: '',
-    sub_agent_status: {
-      orchestrator: 'pending',
-      scanner: 'pending',
-      improver: 'pending',
-      generator: 'pending'
-    }
-  };
 
   constructor() {
-    // Initialize core components
+    // Initialize core systems
     this.logger = new Logger();
-    this.memoryManager = new MemoryManager(this.logger);
-    this.taskManager = new TaskManager(this.logger);
     this.aiClient = new AIClient(this.logger);
-    
+    this.taskManager = new TaskManager(this.logger);
+    this.memoryManager = new MemoryManager(this.logger);
+
     // Initialize sub-agents
-    this.scannerAgent = new ScannerAgent(this.logger, this.memoryManager, this.aiClient);
-    this.improverAgent = new ImproverAgent(this.logger, this.memoryManager, this.aiClient);
-    this.generatorAgent = new GeneratorAgent(this.logger, this.memoryManager, this.aiClient);
+    this.scannerAgent = new ScannerAgent(this.logger, this.aiClient, this.memoryManager, this.taskManager);
+    this.improverAgent = new ImproverAgent(this.logger, this.aiClient, this.memoryManager, this.taskManager);
+    this.generatorAgent = new GeneratorAgent(this.logger, this.aiClient, this.memoryManager, this.taskManager);
 
     // Initialize Supabase client
     const supabaseUrl = process.env.SUPABASE_URL;
@@ -61,84 +44,86 @@ export class ClaudeAgentSystem {
     this.supabase = createClient(supabaseUrl, supabaseKey);
   }
 
-  async execute(config: AgentConfig): Promise<void> {
-    if (this.isRunning) {
-      throw new Error('Agent system is already running. Please wait for current execution to complete.');
-    }
-
-    this.isRunning = true;
+  async executeAgent(config: AgentConfig): Promise<any> {
+    await this.logger.startSession(config.projectName);
     
     try {
-      await this.logger.startSession(config.projectName);
-      await this.logger.info('orchestrator', 'Starting Claude Agent System execution', {
+      await this.logger.info('orchestrator', 'Starting agent execution', {
         project_name: config.projectName,
         mode: config.mode,
-        ai_engine: config.aiEngine,
-        options: config.options
+        ai_engine: config.aiEngine
       });
 
-      // Initialize or get project
-      this.currentProject = await this.initializeProject(config.projectName);
+      // Step 1: Get or create project
+      const project = await this.getOrCreateProject(config.projectName);
       
-      // Set logger context
-      this.logger.setContext(this.currentProject.id);
+      // Step 2: Set logging context
+      this.logger.setContext(project.id);
 
-      // Reset progress
-      this.resetProgress();
+      // Step 3: Create workflow based on execution mode
+      const workflow = await this.taskManager.createWorkflow(
+        project.id,
+        config.mode,
+        {
+          projectName: config.projectName,
+          projectPath: process.cwd(),
+          mode: config.mode,
+          aiEngine: config.aiEngine,
+          options: config.options || {}
+        }
+      );
 
-      // Execute based on mode
-      switch (config.mode) {
-        case 'scan':
-          await this.executeScanMode(config);
-          break;
-        case 'enhance':
-          await this.executeEnhanceMode(config);
-          break;
-        case 'add_modules':
-          await this.executeGenerateMode(config);
-          break;
-        case 'full':
-          await this.executeFullMode(config);
-          break;
-        default:
-          throw new Error(`Unknown execution mode: ${config.mode}`);
-      }
-
-      await this.logger.info('orchestrator', 'Claude Agent System execution completed successfully', {
-        project_id: this.currentProject.id,
+      await this.logger.info('orchestrator', `Created workflow: ${workflow.id}`, {
+        workflow_id: workflow.id,
         mode: config.mode,
-        final_progress: this.currentProgress
+        sub_tasks: workflow.input_data.sub_task_ids?.length || 0
       });
 
-      await this.logger.endSession('Execution completed successfully');
+      // Step 4: Execute workflow
+      const results = await this.executeWorkflow(workflow, project);
+
+      // Step 5: Generate final report
+      const report = await this.generateExecutionReport(project, workflow, results);
+
+      await this.logger.info('orchestrator', 'Agent execution completed successfully', {
+        project_id: project.id,
+        workflow_id: workflow.id,
+        execution_time: Date.now() - new Date(workflow.started_at || Date.now()).getTime(),
+        results_summary: this.summarizeResults(results)
+      });
+
+      await this.logger.endSession(`Completed ${config.mode} execution for ${config.projectName}`);
+
+      return {
+        project,
+        workflow,
+        results,
+        report
+      };
 
     } catch (error) {
-      await this.logger.error('orchestrator', 'Claude Agent System execution failed', {
+      await this.logger.error('orchestrator', 'Agent execution failed', {
         project_name: config.projectName,
         mode: config.mode,
-        error: error instanceof Error ? error.message : String(error),
-        progress: this.currentProgress
+        error: error instanceof Error ? error.message : String(error)
       }, error instanceof Error ? error : undefined);
 
-      await this.logger.endSession(`Execution failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      
+      await this.logger.endSession(`Failed ${config.mode} execution: ${error instanceof Error ? error.message : String(error)}`);
+
       throw error;
-    } finally {
-      this.isRunning = false;
-      this.currentProject = null;
     }
   }
 
-  private async initializeProject(projectName: string): Promise<Project> {
+  private async getOrCreateProject(projectName: string): Promise<Project> {
     try {
       // Check if project already exists
-      const { data: existingProject, error: fetchError } = await this.supabase
+      const { data: existingProject, error: searchError } = await this.supabase
         .from('projects')
         .select('*')
         .eq('name', projectName)
         .single();
 
-      if (existingProject && !fetchError) {
+      if (existingProject && !searchError) {
         await this.logger.info('orchestrator', `Using existing project: ${projectName}`, {
           project_id: existingProject.id,
           created_at: existingProject.created_at
@@ -147,16 +132,13 @@ export class ClaudeAgentSystem {
       }
 
       // Create new project
-      const newProject: Partial<Project> = {
-        id: uuidv4(),
+      const newProject: Omit<Project, 'id' | 'created_at' | 'last_activity'> = {
         name: projectName,
-        created_at: new Date().toISOString(),
-        last_activity: new Date().toISOString(),
         settings: {
           default_ai_engine: 'claude',
           auto_enhance: false,
           max_file_size_mb: 10,
-          excluded_patterns: ['node_modules', '.git', 'dist'],
+          excluded_patterns: ['node_modules', '.git', 'dist', 'build'],
           preferred_frameworks: ['react', 'typescript']
         },
         stats: {
@@ -184,8 +166,9 @@ export class ClaudeAgentSystem {
       });
 
       return createdProject as Project;
+
     } catch (error) {
-      await this.logger.error('orchestrator', 'Failed to initialize project', {
+      await this.logger.error('orchestrator', 'Failed to get or create project', {
         project_name: projectName,
         error: error instanceof Error ? error.message : String(error)
       });
@@ -193,531 +176,513 @@ export class ClaudeAgentSystem {
     }
   }
 
-  private resetProgress(): void {
-    this.currentProgress = {
-      overall_progress: 0,
-      current_stage: 'Initializing',
-      stages_completed: [],
-      estimated_completion: '',
-      sub_agent_status: {
-        orchestrator: 'in_progress',
-        scanner: 'pending',
-        improver: 'pending',
-        generator: 'pending'
-      }
+  private async executeWorkflow(workflow: Task, project: Project): Promise<any> {
+    const mode = workflow.task_type;
+    const subTaskIds = workflow.input_data.sub_task_ids || [];
+    
+    await this.logger.info('orchestrator', `Executing workflow for mode: ${mode}`, {
+      workflow_id: workflow.id,
+      sub_tasks: subTaskIds.length
+    });
+
+    const results: any = {
+      mode,
+      scan_result: null,
+      enhancement_result: null,
+      generation_result: null,
+      sub_task_results: []
     };
-  }
-
-  private updateProgress(stage: string, progress: number, completedStages?: string[]): void {
-    this.currentProgress.current_stage = stage;
-    this.currentProgress.overall_progress = Math.min(100, Math.max(0, progress));
-    
-    if (completedStages) {
-      this.currentProgress.stages_completed.push(...completedStages);
-    }
-
-    // Estimate completion time
-    if (progress > 0 && progress < 100) {
-      const remainingProgress = 100 - progress;
-      const estimatedMinutes = Math.ceil((remainingProgress / progress) * 5); // Rough estimate
-      const estimatedCompletion = new Date(Date.now() + estimatedMinutes * 60000);
-      this.currentProgress.estimated_completion = estimatedCompletion.toISOString();
-    }
-  }
-
-  private updateAgentStatus(agentType: AgentType, status: 'pending' | 'in_progress' | 'completed' | 'failed'): void {
-    this.currentProgress.sub_agent_status[agentType] = status;
-  }
-
-  private async executeScanMode(config: AgentConfig): Promise<void> {
-    this.updateProgress('Starting Scan Analysis', 10);
-    
-    // Create scan task
-    const scanTask = await this.taskManager.createTask(
-      this.currentProject!.id,
-      'scan',
-      'scanner',
-      {
-        project_path: config.options?.projectPath || process.cwd(),
-        max_files: config.options?.maxFiles || 100,
-        target_files: config.options?.targetFiles || []
-      },
-      undefined,
-      {
-        ai_engine: config.aiEngine,
-        priority: 10
-      }
-    );
-
-    this.updateProgress('Executing Scan', 20);
-    this.updateAgentStatus('scanner', 'in_progress');
 
     try {
-      await this.taskManager.startTask(scanTask.id);
-      
-      const scanResult = await this.scannerAgent.execute(scanTask);
-      
-      await this.taskManager.completeTask(
-        scanTask.id,
-        { scan_result: scanResult },
-        scanResult.structure_analysis.file_count * 10, // Rough token estimate
-        0.01 // Rough cost estimate
-      );
+      // Start workflow task
+      await this.taskManager.startTask(workflow.id);
 
-      this.updateAgentStatus('scanner', 'completed');
-      this.updateProgress('Scan Completed', 100, ['Code Analysis']);
-
-      await this.logger.info('orchestrator', 'Scan mode completed successfully', {
-        task_id: scanTask.id,
-        files_analyzed: scanResult.structure_analysis.file_count,
-        issues_found: scanResult.issues.length,
-        opportunities_found: scanResult.opportunities.length
-      });
-
-    } catch (error) {
-      this.updateAgentStatus('scanner', 'failed');
-      await this.taskManager.failTask(scanTask.id, error instanceof Error ? error.message : String(error));
-      throw error;
-    }
-  }
-
-  private async executeEnhanceMode(config: AgentConfig): Promise<void> {
-    this.updateProgress('Starting Enhancement Analysis', 5);
-
-    // First, run scan if no scan results provided
-    let scanTask: Task | null = null;
-    let scanResult: any = null;
-
-    if (!config.options?.scanResults) {
-      this.updateProgress('Running prerequisite scan', 10);
-      this.updateAgentStatus('scanner', 'in_progress');
-
-      scanTask = await this.taskManager.createTask(
-        this.currentProject!.id,
-        'scan',
-        'scanner',
-        {
-          project_path: config.options?.projectPath || process.cwd(),
-          max_files: config.options?.maxFiles || 100
-        },
-        undefined,
-        {
-          ai_engine: config.aiEngine,
-          priority: 9
-        }
-      );
-
-      await this.taskManager.startTask(scanTask.id);
-      scanResult = await this.scannerAgent.execute(scanTask);
-      await this.taskManager.completeTask(scanTask.id, { scan_result: scanResult });
-      
-      this.updateAgentStatus('scanner', 'completed');
-      this.updateProgress('Scan completed, starting enhancement', 40, ['Code Analysis']);
-    } else {
-      scanResult = config.options.scanResults;
-      this.updateProgress('Using provided scan results', 20);
-    }
-
-    // Run enhancement
-    this.updateAgentStatus('improver', 'in_progress');
-
-    const enhanceTask = await this.taskManager.createTask(
-      this.currentProject!.id,
-      'enhance',
-      'improver',
-      {
-        project_path: config.options?.projectPath || process.cwd(),
-        scan_results: scanResult,
-        target_component: config.options?.targetComponent,
-        auto_apply: config.options?.autoApply || false
-      },
-      scanTask?.id,
-      {
-        ai_engine: config.aiEngine,
-        priority: 8
-      }
-    );
-
-    this.updateProgress('Analyzing UX improvements', 60);
-
-    try {
-      await this.taskManager.startTask(enhanceTask.id);
-      
-      const enhanceResult = await this.improverAgent.execute(enhanceTask);
-      
-      await this.taskManager.completeTask(
-        enhanceTask.id,
-        { enhancement_result: enhanceResult },
-        enhanceResult.improvements.length * 50, // Rough token estimate
-        0.05 // Rough cost estimate
-      );
-
-      this.updateAgentStatus('improver', 'completed');
-      this.updateProgress('Enhancement Completed', 100, ['UX Analysis']);
-
-      await this.logger.info('orchestrator', 'Enhance mode completed successfully', {
-        task_id: enhanceTask.id,
-        improvements_found: enhanceResult.improvements.length,
-        ux_score_improvement: enhanceResult.ux_score_after - enhanceResult.ux_score_before
-      });
-
-    } catch (error) {
-      this.updateAgentStatus('improver', 'failed');
-      await this.taskManager.failTask(enhanceTask.id, error instanceof Error ? error.message : String(error));
-      throw error;
-    }
-  }
-
-  private async executeGenerateMode(config: AgentConfig): Promise<void> {
-    this.updateProgress('Starting Module Generation', 10);
-    this.updateAgentStatus('generator', 'in_progress');
-
-    const generateTask = await this.taskManager.createTask(
-      this.currentProject!.id,
-      'add_modules',
-      'generator',
-      {
-        project_path: config.options?.projectPath || process.cwd(),
-        module_request: config.options?.moduleRequest || config.options?.description,
-        output_directory: config.options?.outputDirectory || 'generated',
-        auto_generate: config.options?.autoGenerate || false,
-        frameworks: config.options?.frameworks
-      },
-      undefined,
-      {
-        ai_engine: config.aiEngine,
-        priority: 7
-      }
-    );
-
-    this.updateProgress('Generating modules', 40);
-
-    try {
-      await this.taskManager.startTask(generateTask.id);
-      
-      const generateResult = await this.generatorAgent.execute(generateTask);
-      
-      await this.taskManager.completeTask(
-        generateTask.id,
-        { generation_result: generateResult },
-        generateResult.generated_modules.length * 100, // Rough token estimate
-        0.1 // Rough cost estimate
-      );
-
-      this.updateAgentStatus('generator', 'completed');
-      this.updateProgress('Module Generation Completed', 100, ['Module Generation']);
-
-      await this.logger.info('orchestrator', 'Generate mode completed successfully', {
-        task_id: generateTask.id,
-        modules_generated: generateResult.generated_modules.length,
-        integration_steps: generateResult.integration_instructions.length
-      });
-
-    } catch (error) {
-      this.updateAgentStatus('generator', 'failed');
-      await this.taskManager.failTask(generateTask.id, error instanceof Error ? error.message : String(error));
-      throw error;
-    }
-  }
-
-  private async executeFullMode(config: AgentConfig): Promise<void> {
-    this.updateProgress('Starting Full Analysis Workflow', 5);
-
-    const workflow = await this.taskManager.createWorkflow(
-      this.currentProject!.id,
-      'full',
-      {
-        project_path: config.options?.projectPath || process.cwd(),
-        max_files: config.options?.maxFiles || 100,
-        module_request: config.options?.moduleRequest,
-        auto_apply: config.options?.autoApply || false,
-        auto_generate: config.options?.autoGenerate || false
-      }
-    );
-
-    await this.taskManager.startTask(workflow.id);
-
-    try {
-      // Step 1: Scan
-      this.updateProgress('Phase 1: Code Analysis', 15);
-      this.updateAgentStatus('scanner', 'in_progress');
-
-      const subTasks = await this.taskManager.getTasksByParent(workflow.id);
-      const scanTask = subTasks.find(t => t.agent_type === 'scanner');
-      
-      if (!scanTask) {
-        throw new Error('Scan task not found in workflow');
-      }
-
-      await this.taskManager.startTask(scanTask.id);
-      const scanResult = await this.scannerAgent.execute(scanTask);
-      await this.taskManager.completeTask(scanTask.id, { scan_result: scanResult });
-      
-      this.updateAgentStatus('scanner', 'completed');
-      this.updateProgress('Phase 1 Complete: Analysis finished', 35, ['Code Analysis']);
-
-      // Step 2: Enhance
-      this.updateProgress('Phase 2: UX Enhancement', 40);
-      this.updateAgentStatus('improver', 'in_progress');
-
-      const improveTask = subTasks.find(t => t.agent_type === 'improver');
-      if (!improveTask) {
-        throw new Error('Improve task not found in workflow');
-      }
-
-      // Update improve task with scan results
-      improveTask.input_data.scan_results = scanResult;
-      
-      await this.taskManager.startTask(improveTask.id);
-      const enhanceResult = await this.improverAgent.execute(improveTask);
-      await this.taskManager.completeTask(improveTask.id, { enhancement_result: enhanceResult });
-      
-      this.updateAgentStatus('improver', 'completed');
-      this.updateProgress('Phase 2 Complete: UX improvements identified', 65, ['UX Analysis']);
-
-      // Step 3: Generate (if module request provided)
-      if (config.options?.moduleRequest) {
-        this.updateProgress('Phase 3: Module Generation', 70);
-        this.updateAgentStatus('generator', 'in_progress');
-
-        const generateTask = subTasks.find(t => t.agent_type === 'generator');
-        if (!generateTask) {
-          throw new Error('Generate task not found in workflow');
+      // Execute sub-tasks in sequence based on mode
+      for (const subTaskId of subTaskIds) {
+        const subTask = await this.taskManager.getTask(subTaskId);
+        if (!subTask) {
+          await this.logger.warn('orchestrator', `Sub-task not found: ${subTaskId}`);
+          continue;
         }
 
-        await this.taskManager.startTask(generateTask.id);
-        const generateResult = await this.generatorAgent.execute(generateTask);
-        await this.taskManager.completeTask(generateTask.id, { generation_result: generateResult });
-        
-        this.updateAgentStatus('generator', 'completed');
-        this.updateProgress('Phase 3 Complete: Modules generated', 90, ['Module Generation']);
+        await this.logger.info('orchestrator', `Executing sub-task: ${subTask.agent_type}`, {
+          sub_task_id: subTaskId,
+          agent_type: subTask.agent_type,
+          task_type: subTask.task_type
+        });
+
+        let subTaskResult;
+
+        switch (subTask.agent_type) {
+          case 'scanner':
+            subTaskResult = await this.scannerAgent.executeTask(subTask);
+            results.scan_result = subTaskResult;
+            
+            // Pass scan results to subsequent tasks
+            if (mode === 'enhance' || mode === 'full') {
+              await this.updateSubsequentTasks(subTaskIds, subTaskId, { scanResults: subTaskResult });
+            }
+            break;
+
+          case 'improver':
+            // Ensure scan results are available
+            const scanResultsForImprover = results.scan_result || subTask.input_data.scanResults;
+            if (!scanResultsForImprover) {
+              throw new Error('Scan results required for improvement task');
+            }
+            
+            const improverInputData = {
+              ...subTask.input_data,
+              scanResults: scanResultsForImprover
+            };
+            
+            const improverTask = { ...subTask, input_data: improverInputData };
+            subTaskResult = await this.improverAgent.executeTask(improverTask);
+            results.enhancement_result = subTaskResult;
+            break;
+
+          case 'generator':
+            subTaskResult = await this.generatorAgent.executeTask(subTask);
+            results.generation_result = subTaskResult;
+            break;
+
+          default:
+            await this.logger.warn('orchestrator', `Unknown agent type: ${subTask.agent_type}`);
+            continue;
+        }
+
+        results.sub_task_results.push({
+          task_id: subTaskId,
+          agent_type: subTask.agent_type,
+          result: subTaskResult
+        });
+
+        await this.logger.info('orchestrator', `Sub-task completed: ${subTask.agent_type}`, {
+          sub_task_id: subTaskId,
+          agent_type: subTask.agent_type
+        });
       }
 
-      // Complete workflow
+      // Complete the workflow
       await this.taskManager.completeTask(
         workflow.id,
-        {
-          scan_result: scanResult,
-          enhancement_result: enhanceResult,
-          workflow_completed: true
-        }
+        { workflow_results: results },
+        this.calculateTotalTokens(results),
+        this.calculateTotalCost(results)
       );
 
-      this.updateProgress('Full Analysis Complete', 100, ['Complete Workflow']);
+      // Store workflow insights
+      await this.storeWorkflowInsights(project.id, workflow, results);
 
-      await this.logger.info('orchestrator', 'Full mode completed successfully', {
-        workflow_id: workflow.id,
-        phases_completed: this.currentProgress.stages_completed.length,
-        sub_tasks_completed: subTasks.length
-      });
+      return results;
 
     } catch (error) {
-      await this.taskManager.failTask(workflow.id, error instanceof Error ? error.message : String(error));
+      await this.logger.error('orchestrator', 'Workflow execution failed', {
+        workflow_id: workflow.id,
+        mode,
+        error: error instanceof Error ? error.message : String(error)
+      });
+
+      await this.taskManager.failTask(
+        workflow.id,
+        error instanceof Error ? error.message : String(error),
+        error instanceof Error ? error.stack : undefined
+      );
+
       throw error;
     }
   }
 
-  // Public methods for external access
-  getCurrentProgress(): AgentProgress {
-    return { ...this.currentProgress };
-  }
-
-  getCurrentProject(): Project | null {
-    return this.currentProject;
-  }
-
-  isSystemRunning(): boolean {
-    return this.isRunning;
-  }
-
-  async getSystemCapabilities(): Promise<Record<string, any>> {
-    return {
-      version: '1.0.0',
-      ai_engines: ['claude'],
-      execution_modes: ['scan', 'enhance', 'add_modules', 'full'],
-      scanner_capabilities: this.scannerAgent.getCapabilities(),
-      improver_capabilities: this.improverAgent.getCapabilities(),
-      generator_capabilities: this.generatorAgent.getCapabilities(),
-      max_concurrent_tasks: parseInt(process.env.MAX_CONCURRENT_TASKS || '5'),
-      supported_file_types: [
-        'TypeScript/JavaScript',
-        'React/Vue/Svelte',
-        'CSS/SCSS',
-        'HTML',
-        'JSON/YAML',
-        'Markdown'
-      ],
-      features: [
-        'Code Analysis',
-        'UX Enhancement',
-        'Module Generation',
-        'Memory System',
-        'Task Orchestration',
-        'Progress Tracking',
-        'Cost Optimization',
-        'Dual Logging'
-      ]
-    };
-  }
-
-  async getProjectStats(projectId?: string): Promise<Record<string, any>> {
-    const targetProjectId = projectId || this.currentProject?.id;
-    
-    if (!targetProjectId) {
-      throw new Error('No project specified and no current project active');
-    }
-
-    const [taskStats, memoryStats, usageStats] = await Promise.all([
-      this.taskManager.getTaskStatistics(targetProjectId),
-      this.memoryManager.getMemoryStatistics(targetProjectId),
-      this.aiClient.getUsageStats()
-    ]);
-
-    return {
-      project_id: targetProjectId,
-      task_statistics: taskStats,
-      memory_statistics: memoryStats,
-      ai_usage: usageStats,
-      last_updated: new Date().toISOString()
-    };
-  }
-
-  async getRecentLogs(limit: number = 50): Promise<any[]> {
-    const projectId = this.currentProject?.id;
-    return this.logger.getRecentLogs(limit, projectId);
-  }
-
-  async getLearningsSummary(projectId?: string): Promise<Record<string, any>> {
-    const targetProjectId = projectId || this.currentProject?.id;
-    
-    if (!targetProjectId) {
-      throw new Error('No project specified and no current project active');
-    }
-
-    return this.memoryManager.getLearningsSummary(targetProjectId);
-  }
-
-  // Maintenance methods
-  async performMaintenance(): Promise<void> {
-    await this.logger.info('orchestrator', 'Starting system maintenance');
-
+  private async updateSubsequentTasks(
+    subTaskIds: string[],
+    completedTaskId: string,
+    additionalData: any
+  ): Promise<void> {
     try {
-      const retentionDays = parseInt(process.env.MEMORY_RETENTION_DAYS || '30');
-      
-      // Cleanup old logs
-      await this.logger.cleanupOldLogs(retentionDays);
-      
-      // Cleanup old tasks
-      await this.taskManager.cleanupCompletedTasks(7);
-      
-      // Cleanup old memories for current project
-      if (this.currentProject) {
-        await this.memoryManager.cleanupOldMemories(this.currentProject.id, retentionDays);
+      const completedIndex = subTaskIds.indexOf(completedTaskId);
+      if (completedIndex === -1) return;
+
+      // Update all subsequent tasks with additional data
+      for (let i = completedIndex + 1; i < subTaskIds.length; i++) {
+        const taskId = subTaskIds[i];
+        const task = await this.taskManager.getTask(taskId);
+        
+        if (task) {
+          const updatedInputData = {
+            ...task.input_data,
+            ...additionalData
+          };
+
+          await this.supabase
+            .from('tasks')
+            .update({ input_data: updatedInputData })
+            .eq('id', taskId);
+
+          await this.logger.debug('orchestrator', `Updated sub-task input data: ${taskId}`, {
+            task_id: taskId,
+            additional_data_keys: Object.keys(additionalData)
+          });
+        }
+      }
+    } catch (error) {
+      await this.logger.warn('orchestrator', 'Failed to update subsequent tasks', {
+        completed_task_id: completedTaskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  private calculateTotalTokens(results: any): number {
+    let total = 0;
+    
+    if (results.scan_result?.tokensUsed) {
+      total += results.scan_result.tokensUsed;
+    }
+    
+    if (results.enhancement_result?.improvements) {
+      total += results.enhancement_result.improvements.reduce(
+        (sum: number, imp: any) => sum + (imp.tokensUsed || 0), 0
+      );
+    }
+    
+    if (results.generation_result?.generated_modules) {
+      total += results.generation_result.generated_modules.reduce(
+        (sum: number, mod: any) => sum + (mod.tokensUsed || 0), 0
+      );
+    }
+    
+    return total;
+  }
+
+  private calculateTotalCost(results: any): number {
+    let total = 0;
+    
+    if (results.scan_result?.costEstimate) {
+      total += results.scan_result.costEstimate;
+    }
+    
+    if (results.enhancement_result?.improvements) {
+      total += results.enhancement_result.improvements.reduce(
+        (sum: number, imp: any) => sum + (imp.costEstimate || 0), 0
+      );
+    }
+    
+    if (results.generation_result?.generated_modules) {
+      total += results.generation_result.generated_modules.reduce(
+        (sum: number, mod: any) => sum + (mod.costEstimate || 0), 0
+      );
+    }
+    
+    return total;
+  }
+
+  private summarizeResults(results: any): any {
+    const summary: any = {
+      mode: results.mode,
+      sub_tasks_executed: results.sub_task_results.length
+    };
+
+    if (results.scan_result) {
+      summary.scan = {
+        files_analyzed: results.scan_result.structure_analysis.file_count,
+        issues_found: results.scan_result.issues.length,
+        opportunities_found: results.scan_result.opportunities.length,
+        complexity_score: results.scan_result.structure_analysis.complexity_score
+      };
+    }
+
+    if (results.enhancement_result) {
+      summary.enhancement = {
+        improvements_suggested: results.enhancement_result.improvements.length,
+        ux_score_improvement: results.enhancement_result.ux_score_after - results.enhancement_result.ux_score_before,
+        implementation_steps: results.enhancement_result.implementation_plan.length
+      };
+    }
+
+    if (results.generation_result) {
+      summary.generation = {
+        modules_generated: results.generation_result.generated_modules.length,
+        module_types: results.generation_result.generated_modules.map((m: any) => m.type),
+        integration_steps: results.generation_result.integration_instructions.length
+      };
+    }
+
+    return summary;
+  }
+
+  private async storeWorkflowInsights(
+    projectId: string,
+    workflow: Task,
+    results: any
+  ): Promise<void> {
+    try {
+      // Store overall workflow insight
+      await this.memoryManager.storeInsight(
+        projectId,
+        `Workflow completed: ${workflow.task_type} mode execution`,
+        {
+          workflow_id: workflow.id,
+          mode: workflow.task_type,
+          sub_tasks_executed: results.sub_task_results.length,
+          total_tokens: this.calculateTotalTokens(results),
+          total_cost: this.calculateTotalCost(results),
+          results_summary: this.summarizeResults(results)
+        },
+        9 // Very high importance
+      );
+
+      // Store mode-specific insights
+      if (results.scan_result) {
+        await this.memoryManager.storeSuccess(
+          projectId,
+          `Successful scan execution`,
+          `Analyzed ${results.scan_result.structure_analysis.file_count} files, found ${results.scan_result.issues.length} issues`,
+          {
+            files_analyzed: results.scan_result.structure_analysis.file_count,
+            issues_found: results.scan_result.issues.length,
+            complexity_score: results.scan_result.structure_analysis.complexity_score
+          },
+          8
+        );
       }
 
-      await this.logger.info('orchestrator', 'System maintenance completed');
+      if (results.enhancement_result) {
+        await this.memoryManager.storeSuccess(
+          projectId,
+          `Successful enhancement execution`,
+          `Generated ${results.enhancement_result.improvements.length} improvements`,
+          {
+            improvements_count: results.enhancement_result.improvements.length,
+            ux_improvement: results.enhancement_result.ux_score_after - results.enhancement_result.ux_score_before
+          },
+          8
+        );
+      }
+
+      if (results.generation_result) {
+        await this.memoryManager.storeSuccess(
+          projectId,
+          `Successful generation execution`,
+          `Generated ${results.generation_result.generated_modules.length} modules`,
+          {
+            modules_count: results.generation_result.generated_modules.length,
+            module_types: results.generation_result.generated_modules.map((m: any) => m.type)
+          },
+          8
+        );
+      }
+
+      // Store execution pattern
+      await this.memoryManager.storePattern(
+        projectId,
+        `Workflow execution pattern: ${workflow.task_type}`,
+        [`Sub-tasks: ${results.sub_task_results.length}`, `Total tokens: ${this.calculateTotalTokens(results)}`],
+        1,
+        7
+      );
+
     } catch (error) {
-      await this.logger.error('orchestrator', 'System maintenance failed', {
+      await this.logger.warn('orchestrator', 'Failed to store workflow insights', {
+        project_id: projectId,
+        workflow_id: workflow.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  private async generateExecutionReport(
+    project: Project,
+    workflow: Task,
+    results: any
+  ): Promise<string> {
+    const startTime = new Date(workflow.started_at || Date.now());
+    const endTime = new Date(workflow.completed_at || Date.now());
+    const duration = endTime.getTime() - startTime.getTime();
+
+    let report = `# Claude Agent System - Execution Report\n\n`;
+    report += `**Project:** ${project.name}\n`;
+    report += `**Mode:** ${workflow.task_type}\n`;
+    report += `**Executed:** ${endTime.toLocaleString()}\n`;
+    report += `**Duration:** ${Math.round(duration / 1000)} seconds\n`;
+    report += `**Workflow ID:** ${workflow.id}\n\n`;
+
+    // Add summary
+    const summary = this.summarizeResults(results);
+    report += `## Summary\n\n`;
+    report += `- Sub-tasks executed: ${summary.sub_tasks_executed}\n`;
+    report += `- Total tokens used: ${this.calculateTotalTokens(results)}\n`;
+    report += `- Total cost: $${this.calculateTotalCost(results).toFixed(4)}\n\n`;
+
+    // Add scan results
+    if (results.scan_result) {
+      report += `## Code Analysis Results\n\n`;
+      report += `- Files analyzed: ${results.scan_result.structure_analysis.file_count}\n`;
+      report += `- Components found: ${results.scan_result.structure_analysis.component_count}\n`;
+      report += `- Complexity score: ${results.scan_result.structure_analysis.complexity_score}/10\n`;
+      report += `- Architecture patterns: ${results.scan_result.structure_analysis.architecture_patterns.join(', ')}\n`;
+      report += `- Issues found: ${results.scan_result.issues.length}\n`;
+      report += `- Opportunities identified: ${results.scan_result.opportunities.length}\n\n`;
+
+      if (results.scan_result.issues.length > 0) {
+        report += `### Critical Issues\n\n`;
+        const criticalIssues = results.scan_result.issues.filter((issue: any) => issue.severity === 'critical');
+        criticalIssues.forEach((issue: any) => {
+          report += `- **${issue.type}** in ${issue.file_path}: ${issue.description}\n`;
+        });
+        report += '\n';
+      }
+    }
+
+    // Add enhancement results
+    if (results.enhancement_result) {
+      report += `## UX Enhancement Results\n\n`;
+      report += `- Improvements suggested: ${results.enhancement_result.improvements.length}\n`;
+      report += `- UX score before: ${results.enhancement_result.ux_score_before}/10\n`;
+      report += `- UX score after: ${results.enhancement_result.ux_score_after}/10\n`;
+      report += `- Score improvement: +${(results.enhancement_result.ux_score_after - results.enhancement_result.ux_score_before).toFixed(1)}\n`;
+      report += `- Implementation steps: ${results.enhancement_result.implementation_plan.length}\n\n`;
+    }
+
+    // Add generation results
+    if (results.generation_result) {
+      report += `## Module Generation Results\n\n`;
+      report += `- Modules generated: ${results.generation_result.generated_modules.length}\n`;
+      
+      const moduleTypes = results.generation_result.generated_modules.reduce((types: any, mod: any) => {
+        types[mod.type] = (types[mod.type] || 0) + 1;
+        return types;
+      }, {});
+      
+      report += `- Module types:\n`;
+      Object.entries(moduleTypes).forEach(([type, count]) => {
+        report += `  - ${type}: ${count}\n`;
+      });
+      report += `- Integration instructions: ${results.generation_result.integration_instructions.length}\n`;
+      report += `- Testing suggestions: ${results.generation_result.testing_suggestions.length}\n\n`;
+    }
+
+    // Add recommendations
+    report += `## Recommendations\n\n`;
+    report += this.generateRecommendations(results);
+
+    return report;
+  }
+
+  private generateRecommendations(results: any): string {
+    let recommendations = '';
+
+    if (results.scan_result) {
+      const criticalIssues = results.scan_result.issues.filter((issue: any) => issue.severity === 'critical');
+      if (criticalIssues.length > 0) {
+        recommendations += `### Immediate Actions Required\n\n`;
+        criticalIssues.forEach((issue: any) => {
+          recommendations += `- Fix ${issue.type} issue in ${issue.file_path}: ${issue.suggestion}\n`;
+        });
+        recommendations += '\n';
+      }
+
+      const highImpactOpportunities = results.scan_result.opportunities.filter((opp: any) => opp.impact === 'high');
+      if (highImpactOpportunities.length > 0) {
+        recommendations += `### High-Impact Improvements\n\n`;
+        highImpactOpportunities.forEach((opp: any) => {
+          recommendations += `- ${opp.description}: ${opp.implementation_suggestion}\n`;
+        });
+        recommendations += '\n';
+      }
+    }
+
+    if (results.enhancement_result) {
+      const quickWins = results.enhancement_result.improvements.filter((imp: any) => 
+        imp.impact_assessment.implementation_effort <= 3 && imp.impact_assessment.user_experience >= 7
+      );
+      
+      if (quickWins.length > 0) {
+        recommendations += `### Quick UX Wins\n\n`;
+        quickWins.forEach((imp: any) => {
+          recommendations += `- ${imp.description} (Effort: ${imp.impact_assessment.implementation_effort}/10, UX Impact: ${imp.impact_assessment.user_experience}/10)\n`;
+        });
+        recommendations += '\n';
+      }
+    }
+
+    if (results.generation_result) {
+      recommendations += `### Module Integration\n\n`;
+      recommendations += `- Follow the provided integration instructions for ${results.generation_result.generated_modules.length} generated modules\n`;
+      recommendations += `- Implement the suggested testing strategies\n`;
+      recommendations += `- Consider the generated modules as starting points and customize them for your specific needs\n\n`;
+    }
+
+    if (!recommendations) {
+      recommendations = 'No specific recommendations at this time. The analysis completed successfully.\n\n';
+    }
+
+    return recommendations;
+  }
+
+  // Public utility methods
+  async getProjectStatus(projectId: string): Promise<any> {
+    try {
+      const [project, recentTasks, recentLogs, memories] = await Promise.all([
+        this.supabase.from('projects').select('*').eq('id', projectId).single(),
+        this.taskManager.getProjectTasks(projectId, undefined, 10),
+        this.logger.getRecentLogs(10, projectId),
+        this.memoryManager.getLearningsSummary(projectId)
+      ]);
+
+      return {
+        project: project.data,
+        recent_tasks: recentTasks,
+        recent_logs: recentLogs,
+        learning_summary: memories
+      };
+    } catch (error) {
+      await this.logger.error('orchestrator', 'Failed to get project status', {
+        project_id: projectId,
         error: error instanceof Error ? error.message : String(error)
       });
       throw error;
     }
   }
 
-  async shutdown(): Promise<void> {
-    await this.logger.info('orchestrator', 'Shutting down Claude Agent System');
-    
-    if (this.isRunning) {
-      await this.logger.warn('orchestrator', 'Forced shutdown while system was running');
-    }
+  async getSystemStats(): Promise<any> {
+    try {
+      const stats = {
+        ai_usage: this.aiClient.getUsageStats(),
+        active_tasks: (await this.taskManager.getActiveTasks()).length,
+        system_uptime: process.uptime(),
+        memory_usage: process.memoryUsage()
+      };
 
-    // Perform final maintenance
-    await this.performMaintenance();
-    
-    await this.logger.endSession('System shutdown');
+      return stats;
+    } catch (error) {
+      await this.logger.error('orchestrator', 'Failed to get system stats', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
+  }
+
+  async cleanup(): Promise<void> {
+    try {
+      await this.logger.info('orchestrator', 'Starting system cleanup');
+
+      // Cleanup old logs and tasks based on retention settings
+      const retentionDays = parseInt(process.env.MEMORY_RETENTION_DAYS || '30');
+      
+      await Promise.all([
+        this.logger.cleanupOldLogs(retentionDays),
+        this.taskManager.cleanupCompletedTasks(7), // Keep completed tasks for 7 days
+        this.memoryManager.cleanupOldMemories(retentionDays)
+      ]);
+
+      await this.logger.info('orchestrator', 'System cleanup completed');
+    } catch (error) {
+      await this.logger.error('orchestrator', 'System cleanup failed', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }
 
-// Export a default instance for convenience
+// Export a singleton instance
 export const agentSystem = new ClaudeAgentSystem();
-
-// Export configuration helpers
-export function createAgentConfig(
-  projectName: string,
-  mode: ExecutionMode,
-  options?: Partial<AgentConfig['options']>
-): AgentConfig {
-  return {
-    projectName,
-    mode,
-    aiEngine: 'claude',
-    options: {
-      projectPath: process.cwd(),
-      maxFiles: 100,
-      autoApply: false,
-      autoGenerate: false,
-      ...options
-    }
-  };
-}
-
-// CLI runner function
-export async function runAgent(
-  projectName: string,
-  mode: ExecutionMode,
-  options?: Record<string, any>
-): Promise<void> {
-  const config = createAgentConfig(projectName, mode, options);
-  
-  try {
-    await agentSystem.execute(config);
-    console.log('\n✅ Claude Agent System execution completed successfully!');
-    
-    // Show progress summary
-    const progress = agentSystem.getCurrentProgress();
-    console.log(`📊 Final Progress: ${progress.overall_progress}%`);
-    console.log(`🎯 Stages Completed: ${progress.stages_completed.join(', ')}`);
-    
-  } catch (error) {
-    console.error('\n❌ Claude Agent System execution failed:', error instanceof Error ? error.message : error);
-    process.exit(1);
-  }
-}
-
-// Handle CLI execution
-if (require.main === module) {
-  const args = process.argv.slice(2);
-  
-  if (args.length < 2) {
-    console.log(`
-Usage: ts-node agent-core/agent.ts <project-name> <mode> [options]
-
-Modes:
-  scan       - Analyze code structure and identify issues
-  enhance    - Improve UX based on analysis results  
-  add_modules - Generate new modules and components
-  full       - Complete workflow (scan + enhance + generate)
-
-Examples:
-  ts-node agent-core/agent.ts "My Project" scan
-  ts-node agent-core/agent.ts "My Project" enhance --auto-apply
-  ts-node agent-core/agent.ts "My Project" add_modules --module-request "Create a login form component"
-  ts-node agent-core/agent.ts "My Project" full --module-request "Authentication system"
-    `);
-    process.exit(1);
-  }
-
-  const [projectName, mode] = args;
-  const options: Record<string, any> = {};
-
-  // Parse additional options
-  for (let i = 2; i < args.length; i += 2) {
-    const key = args[i]?.replace('--', '');
-    const value = args[i + 1];
-    if (key && value) {
-      options[key] = value === 'true' ? true : value === 'false' ? false : value;
-    }
-  }
-
-  runAgent(projectName, mode as ExecutionMode, options);
-}

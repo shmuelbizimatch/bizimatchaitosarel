@@ -1,134 +1,140 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import { EnhancementResult, Enhancement, CodeChange, ScanResult, ImpactAssessment, ImplementationStep } from '../../types';
+import { EnhancementResult, Enhancement, CodeChange, ImpactAssessment, ImplementationStep, Task, ScanResult } from '../../types';
 import { Logger } from '../logger/logger';
-import { MemoryManager } from '../memory/memoryManager';
 import { AIClient } from '../engines/AIClient';
+import { MemoryManager } from '../memory/memoryManager';
+import { TaskManager } from '../tasks/taskManager';
 
-export class Improver {
+export class ImproverAgent {
   private logger: Logger;
-  private memory: MemoryManager;
   private aiClient: AIClient;
+  private memoryManager: MemoryManager;
+  private taskManager: TaskManager;
 
-  constructor(logger: Logger, memory: MemoryManager, aiClient: AIClient) {
+  constructor(
+    logger: Logger,
+    aiClient: AIClient,
+    memoryManager: MemoryManager,
+    taskManager: TaskManager
+  ) {
     this.logger = logger;
-    this.memory = memory;
     this.aiClient = aiClient;
+    this.memoryManager = memoryManager;
+    this.taskManager = taskManager;
   }
 
-  async enhanceProject(
-    projectPath: string,
-    projectId: string,
-    scanResults: ScanResult,
-    options: {
-      focusAreas?: string[];
-      priorityLevel?: 'low' | 'medium' | 'high';
-      maxChanges?: number;
-    } = {}
-  ): Promise<EnhancementResult> {
-    await this.logger.info('improver', `Starting project enhancement`, {
-      project_id: projectId,
-      focus_areas: options.focusAreas,
-      priority_level: options.priorityLevel || 'medium'
+  async executeTask(task: Task): Promise<EnhancementResult> {
+    await this.logger.info('improver', 'Starting enhancement task', {
+      task_id: task.id,
+      project_id: task.project_id
     });
 
     try {
-      // Get relevant enhancement memories
-      const relevantMemories = await this.memory.getRelevantMemories(
-        projectId,
-        'UX enhancement improvements',
-        'enhance',
-        10
-      );
-
-      // Get user preferences for this project
-      const preferences = await this.memory.getPreferences(projectId);
+      // Extract enhancement parameters from task input
+      const { scanResults, targetComponents, focusAreas } = task.input_data;
       
-      // Build enhancement context
-      const enhancementContext = await this.buildEnhancementContext(
-        projectPath,
+      // Set context for logging
+      this.logger.setContext(task.project_id, task.id);
+
+      // Start the task
+      await this.taskManager.startTask(task.id);
+
+      // Step 1: Analyze scan results and retrieve relevant memories
+      const analysisContext = await this.buildAnalysisContext(task.project_id, scanResults);
+
+      // Step 2: Get UX preferences and patterns from memory
+      const uxPreferences = await this.getUXPreferences(task.project_id);
+      const successPatterns = await this.getSuccessfulPatterns(task.project_id);
+
+      // Step 3: Generate improvement suggestions using Claude
+      const improvements = await this.generateImprovements(
         scanResults,
-        relevantMemories,
-        preferences,
-        options
+        analysisContext,
+        uxPreferences,
+        successPatterns,
+        targetComponents,
+        focusAreas
       );
 
-      // Get AI enhancement suggestions
-      const aiRequest = AIClient.getImproverPrompt(scanResults, enhancementContext);
-      const aiResponse = await this.aiClient.generateResponse(aiRequest);
+      // Step 4: Create implementation plan
+      const implementationPlan = await this.createImplementationPlan(improvements);
 
-      let enhancementResult: EnhancementResult;
-      try {
-        enhancementResult = JSON.parse(aiResponse.content);
-      } catch (error) {
-        await this.logger.error('improver', 'Failed to parse AI enhancement results', {
-          ai_content: aiResponse.content.substring(0, 500),
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw new Error('Invalid AI response format');
-      }
+      // Step 5: Calculate UX scores
+      const uxScores = this.calculateUXScores(scanResults, improvements);
 
-      // Filter and prioritize enhancements
-      enhancementResult = await this.filterAndPrioritizeEnhancements(
-        enhancementResult,
-        options
+      // Step 6: Compile enhancement results
+      const enhancementResult: EnhancementResult = {
+        improvements,
+        ux_score_before: uxScores.before,
+        ux_score_after: uxScores.after,
+        implementation_plan: implementationPlan
+      };
+
+      // Store improvement insights in memory
+      await this.storeImprovementInsights(task.project_id, enhancementResult);
+
+      // Complete the task
+      await this.taskManager.completeTask(
+        task.id,
+        { enhancement_result: enhancementResult },
+        improvements.reduce((sum, imp) => sum + (imp.tokensUsed || 0), 0),
+        improvements.reduce((sum, imp) => sum + (imp.costEstimate || 0), 0)
       );
 
-      // Validate proposed changes
-      enhancementResult = await this.validateEnhancements(
-        projectPath,
-        enhancementResult
-      );
-
-      // Store enhancement insights
-      await this.storeEnhancementInsights(projectId, enhancementResult, scanResults);
-
-      await this.logger.info('improver', 'Project enhancement completed', {
-        project_id: projectId,
-        improvements_count: enhancementResult.improvements?.length || 0,
-        ux_score_improvement: (enhancementResult.ux_score_after || 0) - (enhancementResult.ux_score_before || 0),
-        tokens_used: aiResponse.tokens_used,
-        cost: aiResponse.cost_estimate
+      await this.logger.info('improver', 'Enhancement task completed successfully', {
+        task_id: task.id,
+        improvements_count: improvements.length,
+        ux_score_improvement: uxScores.after - uxScores.before,
+        implementation_steps: implementationPlan.length
       });
 
       return enhancementResult;
 
     } catch (error) {
-      await this.logger.error('improver', 'Project enhancement failed', {
-        project_id: projectId,
+      await this.logger.error('improver', 'Enhancement task failed', {
+        task_id: task.id,
         error: error instanceof Error ? error.message : String(error)
-      });
+      }, error instanceof Error ? error : undefined);
+
+      await this.taskManager.failTask(
+        task.id,
+        error instanceof Error ? error.message : String(error),
+        error instanceof Error ? error.stack : undefined
+      );
+
       throw error;
     }
   }
 
-  private async buildEnhancementContext(
-    projectPath: string,
-    scanResults: ScanResult,
-    relevantMemories: any[],
-    preferences: any[],
-    options: any
-  ): Promise<string> {
-    let context = `Enhancement Context:\n\n`;
+  private async buildAnalysisContext(projectId: string, scanResults: ScanResult): Promise<string> {
+    let context = `UX Enhancement Analysis Context:\n\n`;
 
-    // Project overview
-    context += `Project Analysis Summary:\n`;
-    context += `- Files: ${scanResults.structure_analysis.file_count}\n`;
-    context += `- Components: ${scanResults.structure_analysis.component_count}\n`;
+    // Add scan results summary
+    context += `Project Structure:\n`;
+    context += `- File Count: ${scanResults.structure_analysis.file_count}\n`;
+    context += `- Component Count: ${scanResults.structure_analysis.component_count}\n`;
     context += `- Complexity Score: ${scanResults.structure_analysis.complexity_score}/10\n`;
     context += `- Architecture: ${scanResults.structure_analysis.architecture_patterns.join(', ')}\n\n`;
 
-    // Issues to address
-    if (scanResults.issues && scanResults.issues.length > 0) {
-      context += `Current Issues:\n`;
-      scanResults.issues.forEach(issue => {
-        context += `- ${issue.severity.toUpperCase()}: ${issue.description} (${issue.file_path})\n`;
+    // Add key issues that affect UX
+    const uxRelevantIssues = scanResults.issues.filter(issue => 
+      issue.type === 'accessibility' || 
+      issue.type === 'performance' ||
+      issue.severity === 'high' ||
+      issue.severity === 'critical'
+    );
+
+    if (uxRelevantIssues.length > 0) {
+      context += `UX-Critical Issues:\n`;
+      uxRelevantIssues.forEach(issue => {
+        context += `- ${issue.type} (${issue.severity}): ${issue.description}\n`;
       });
       context += '\n';
     }
 
-    // Opportunities to leverage
-    if (scanResults.opportunities && scanResults.opportunities.length > 0) {
+    // Add opportunities
+    if (scanResults.opportunities.length > 0) {
       context += `Improvement Opportunities:\n`;
       scanResults.opportunities.forEach(opp => {
         context += `- ${opp.type} (${opp.impact} impact, ${opp.effort} effort): ${opp.description}\n`;
@@ -136,557 +142,454 @@ export class Improver {
       context += '\n';
     }
 
-    // Focus areas
-    if (options.focusAreas && options.focusAreas.length > 0) {
-      context += `Focus Areas: ${options.focusAreas.join(', ')}\n\n`;
-    }
-
-    // User preferences
-    if (preferences.length > 0) {
-      context += `User Preferences:\n`;
-      preferences.forEach(pref => {
-        context += `- ${pref.content.preference}: ${pref.content.value} (${pref.content.reasoning})\n`;
-      });
-      context += '\n';
-    }
-
-    // Relevant past enhancements
-    if (relevantMemories.length > 0) {
-      context += `Relevant Past Enhancements:\n`;
-      relevantMemories.forEach(memory => {
-        if (memory.memory_type === 'success') {
-          context += `- Success: ${memory.content.action} → ${memory.content.outcome}\n`;
-        } else if (memory.memory_type === 'insight') {
-          context += `- Insight: ${memory.content.insight}\n`;
-        }
-      });
-      context += '\n';
-    }
-
-    // Sample component analysis
-    const componentFiles = await this.getComponentSamples(projectPath);
-    if (componentFiles.length > 0) {
-      context += `Sample Components for Reference:\n`;
-      for (const { filePath, content } of componentFiles.slice(0, 3)) {
-        context += `\n=== ${filePath} ===\n`;
-        context += content.substring(0, 1500);
-        if (content.length > 1500) {
-          context += '\n... (truncated)';
-        }
-        context += '\n';
-      }
-    }
+    // Add project metrics
+    context += `Code Quality Metrics:\n`;
+    context += `- Lines of Code: ${scanResults.metrics.lines_of_code}\n`;
+    context += `- Cyclomatic Complexity: ${scanResults.metrics.cyclomatic_complexity}\n`;
+    context += `- Maintainability Index: ${scanResults.metrics.maintainability_index}/100\n\n`;
 
     return context;
   }
 
-  private async getComponentSamples(projectPath: string): Promise<Array<{filePath: string, content: string}>> {
-    const samples: Array<{filePath: string, content: string}> = [];
-    
+  private async getUXPreferences(projectId: string): Promise<any[]> {
     try {
-      // Look for common component patterns
-      const componentPatterns = [
-        'components/**/*.{tsx,jsx,ts,js}',
-        'src/components/**/*.{tsx,jsx,ts,js}',
-        'app/components/**/*.{tsx,jsx,ts,js}'
-      ];
-
-      for (const pattern of componentPatterns) {
-        try {
-          const glob = await import('glob');
-          const files = glob.sync(pattern, { cwd: projectPath, absolute: false });
-          
-          for (const file of files.slice(0, 5)) { // Limit to 5 files per pattern
-            try {
-              const fullPath = path.join(projectPath, file);
-              const content = await fs.readFile(fullPath, 'utf-8');
-              
-              // Skip very large files
-              if (content.length < 10000) {
-                samples.push({ filePath: file, content });
-              }
-            } catch (error) {
-              // Skip unreadable files
-              continue;
-            }
-          }
-        } catch (error) {
-          // Pattern not found, continue
-          continue;
-        }
-      }
+      const preferences = await this.memoryManager.getPreferences(projectId);
+      return preferences.filter(pref => 
+        pref.content.preference?.includes('ux') ||
+        pref.content.preference?.includes('ui') ||
+        pref.content.preference?.includes('design') ||
+        pref.content.preference?.includes('user')
+      );
     } catch (error) {
-      await this.logger.debug('improver', 'Could not sample components', {
+      await this.logger.warn('improver', 'Failed to retrieve UX preferences', {
+        project_id: projectId,
         error: error instanceof Error ? error.message : String(error)
       });
+      return [];
     }
-
-    return samples;
   }
 
-  private async filterAndPrioritizeEnhancements(
-    result: EnhancementResult,
-    options: {
-      priorityLevel?: 'low' | 'medium' | 'high';
-      maxChanges?: number;
-      focusAreas?: string[];
+  private async getSuccessfulPatterns(projectId: string): Promise<any[]> {
+    try {
+      const successes = await this.memoryManager.getSuccesses(projectId);
+      return successes.filter(success =>
+        success.content.action?.includes('improvement') ||
+        success.content.action?.includes('enhancement') ||
+        success.content.action?.includes('ux') ||
+        success.content.action?.includes('performance')
+      );
+    } catch (error) {
+      await this.logger.warn('improver', 'Failed to retrieve successful patterns', {
+        project_id: projectId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return [];
     }
-  ): Promise<EnhancementResult> {
-    const maxChanges = options.maxChanges || 10;
-    const priorityLevel = options.priorityLevel || 'medium';
-    const focusAreas = options.focusAreas || [];
+  }
 
-    let filteredImprovements = result.improvements || [];
+  private async generateImprovements(
+    scanResults: ScanResult,
+    analysisContext: string,
+    uxPreferences: any[],
+    successPatterns: any[],
+    targetComponents?: string[],
+    focusAreas?: string[]
+  ): Promise<(Enhancement & { tokensUsed?: number; costEstimate?: number })[]> {
+    try {
+      // Build enhanced context with preferences and patterns
+      let enhancedContext = analysisContext;
 
-    // Filter by focus areas if specified
-    if (focusAreas.length > 0) {
-      filteredImprovements = filteredImprovements.filter(improvement =>
-        focusAreas.some(area => 
-          improvement.enhancement_type.includes(area) ||
-          improvement.description.toLowerCase().includes(area.toLowerCase())
+      if (uxPreferences.length > 0) {
+        enhancedContext += `\nUX Preferences:\n`;
+        uxPreferences.forEach(pref => {
+          enhancedContext += `- ${pref.content.preference}: ${pref.content.value} (${pref.content.reasoning})\n`;
+        });
+        enhancedContext += '\n';
+      }
+
+      if (successPatterns.length > 0) {
+        enhancedContext += `\nSuccessful Past Improvements:\n`;
+        successPatterns.forEach(pattern => {
+          enhancedContext += `- ${pattern.content.action}: ${pattern.content.outcome}\n`;
+        });
+        enhancedContext += '\n';
+      }
+
+      if (targetComponents && targetComponents.length > 0) {
+        enhancedContext += `\nTarget Components: ${targetComponents.join(', ')}\n`;
+      }
+
+      if (focusAreas && focusAreas.length > 0) {
+        enhancedContext += `\nFocus Areas: ${focusAreas.join(', ')}\n`;
+      }
+
+      // Get Claude's improvement suggestions
+      const aiRequest = AIClient.getImproverPrompt(scanResults, enhancedContext);
+      const response = await this.aiClient.generateResponse(aiRequest);
+
+      // Parse Claude's response
+      let improvementData;
+      try {
+        improvementData = JSON.parse(response.content);
+      } catch (parseError) {
+        await this.logger.error('improver', 'Failed to parse Claude improvement response', {
+          response_content: response.content.slice(0, 500)
+        });
+        throw new Error('Invalid response format from Claude');
+      }
+
+      // Transform Claude's suggestions into our format
+      const improvements: (Enhancement & { tokensUsed?: number; costEstimate?: number })[] = 
+        (improvementData.improvements || []).map((imp: any) => ({
+          component_path: imp.component_path || '',
+          enhancement_type: imp.enhancement_type || 'visual',
+          description: imp.description || '',
+          code_changes: (imp.code_changes || []).map((change: any) => ({
+            file_path: change.file_path || '',
+            change_type: change.change_type || 'modify',
+            original_code: change.original_code || '',
+            new_code: change.new_code || '',
+            line_number: change.line_number
+          })),
+          impact_assessment: {
+            user_experience: imp.impact_assessment?.user_experience || 5,
+            performance_impact: imp.impact_assessment?.performance_impact || 0,
+            maintainability: imp.impact_assessment?.maintainability || 5,
+            implementation_effort: imp.impact_assessment?.implementation_effort || 5
+          },
+          tokensUsed: Math.round(response.tokens_used / (improvementData.improvements?.length || 1)),
+          costEstimate: response.cost_estimate / (improvementData.improvements?.length || 1)
+        }));
+
+      // Validate and enhance improvements
+      const validatedImprovements = await this.validateAndEnhanceImprovements(improvements);
+
+      return validatedImprovements;
+
+    } catch (error) {
+      await this.logger.error('improver', 'Failed to generate improvements', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return [];
+    }
+  }
+
+  private async validateAndEnhanceImprovements(
+    improvements: (Enhancement & { tokensUsed?: number; costEstimate?: number })[]
+  ): Promise<(Enhancement & { tokensUsed?: number; costEstimate?: number })[]> {
+    const validated: (Enhancement & { tokensUsed?: number; costEstimate?: number })[] = [];
+
+    for (const improvement of improvements) {
+      try {
+        // Validate that target files exist
+        const validCodeChanges: CodeChange[] = [];
+        
+        for (const change of improvement.code_changes) {
+          if (change.file_path) {
+            try {
+              await fs.access(change.file_path);
+              validCodeChanges.push(change);
+            } catch (error) {
+              await this.logger.warn('improver', `Target file does not exist: ${change.file_path}`);
+            }
+          }
+        }
+
+        // Only include improvements with valid code changes
+        if (validCodeChanges.length > 0) {
+          validated.push({
+            ...improvement,
+            code_changes: validCodeChanges
+          });
+        }
+
+      } catch (error) {
+        await this.logger.warn('improver', 'Failed to validate improvement', {
+          component: improvement.component_path,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
+    return validated;
+  }
+
+  private async createImplementationPlan(
+    improvements: Enhancement[]
+  ): Promise<ImplementationStep[]> {
+    const steps: ImplementationStep[] = [];
+    let stepOrder = 1;
+
+    // Group improvements by type and priority
+    const groupedImprovements = this.groupImprovementsByPriority(improvements);
+
+    // Create steps for each group
+    for (const [priority, group] of Object.entries(groupedImprovements)) {
+      for (const improvement of group) {
+        // Estimate implementation time based on effort and change complexity
+        const effortMultiplier = {
+          low: 1,
+          medium: 2,
+          high: 4
+        };
+
+        const baseTime = improvement.code_changes.length * 15; // 15 minutes per code change
+        const effort = improvement.impact_assessment.implementation_effort;
+        const estimatedTime = baseTime * (effort / 5); // Scale by effort (1-10 scale)
+
+        steps.push({
+          order: stepOrder++,
+          description: `${improvement.enhancement_type}: ${improvement.description}`,
+          estimated_time_minutes: Math.round(estimatedTime),
+          dependencies: this.findDependencies(improvement, improvements)
+        });
+      }
+    }
+
+    // Sort by dependencies and impact
+    return this.optimizeImplementationOrder(steps);
+  }
+
+  private groupImprovementsByPriority(improvements: Enhancement[]): Record<string, Enhancement[]> {
+    const groups: Record<string, Enhancement[]> = {
+      critical: [],
+      high: [],
+      medium: [],
+      low: []
+    };
+
+    improvements.forEach(improvement => {
+      const uxScore = improvement.impact_assessment.user_experience;
+      const effort = improvement.impact_assessment.implementation_effort;
+      
+      // Calculate priority based on UX impact vs effort
+      const priority = uxScore / effort;
+
+      if (priority > 1.5) {
+        groups.critical.push(improvement);
+      } else if (priority > 1.0) {
+        groups.high.push(improvement);
+      } else if (priority > 0.5) {
+        groups.medium.push(improvement);
+      } else {
+        groups.low.push(improvement);
+      }
+    });
+
+    return groups;
+  }
+
+  private findDependencies(improvement: Enhancement, allImprovements: Enhancement[]): string[] {
+    const dependencies: string[] = [];
+
+    // Check if this improvement depends on others
+    for (const other of allImprovements) {
+      if (other === improvement) continue;
+
+      // Check file dependencies
+      const hasFileDependency = improvement.code_changes.some(change =>
+        other.code_changes.some(otherChange =>
+          change.file_path === otherChange.file_path &&
+          (change.line_number || 0) > (otherChange.line_number || 0)
         )
       );
-    }
 
-    // Filter by priority level
-    const minImpact = priorityLevel === 'high' ? 8 : priorityLevel === 'medium' ? 5 : 1;
-    const maxEffort = priorityLevel === 'high' ? 5 : priorityLevel === 'medium' ? 7 : 10;
+      // Check component dependencies
+      const hasComponentDependency = 
+        improvement.component_path.includes(other.component_path) ||
+        other.component_path.includes(improvement.component_path);
 
-    filteredImprovements = filteredImprovements.filter(improvement => {
-      const impact = improvement.impact_assessment.user_experience;
-      const effort = improvement.impact_assessment.implementation_effort;
-      return impact >= minImpact && effort <= maxEffort;
-    });
-
-    // Sort by value score (impact/effort ratio)
-    filteredImprovements.sort((a, b) => {
-      const scoreA = a.impact_assessment.user_experience / a.impact_assessment.implementation_effort;
-      const scoreB = b.impact_assessment.user_experience / b.impact_assessment.implementation_effort;
-      return scoreB - scoreA;
-    });
-
-    // Limit to max changes
-    filteredImprovements = filteredImprovements.slice(0, maxChanges);
-
-    // Update implementation plan
-    const updatedPlan = this.generateImplementationPlan(filteredImprovements);
-
-    return {
-      ...result,
-      improvements: filteredImprovements,
-      implementation_plan: updatedPlan
-    };
-  }
-
-  private generateImplementationPlan(improvements: Enhancement[]): ImplementationStep[] {
-    const steps: ImplementationStep[] = [];
-    let currentOrder = 1;
-
-    // Group by type for logical ordering
-    const groups = {
-      accessibility: improvements.filter(i => i.enhancement_type === 'accessibility'),
-      performance: improvements.filter(i => i.enhancement_type === 'performance'),
-      visual: improvements.filter(i => i.enhancement_type === 'visual'),
-      interactive: improvements.filter(i => i.enhancement_type === 'interactive')
-    };
-
-    // Add steps in logical order
-    for (const [groupName, groupImprovements] of Object.entries(groups)) {
-      if (groupImprovements.length > 0) {
-        steps.push({
-          order: currentOrder++,
-          description: `Implement ${groupName} improvements`,
-          estimated_time_minutes: groupImprovements.reduce(
-            (sum, imp) => sum + (imp.impact_assessment.implementation_effort * 10), 
-            0
-          ),
-          dependencies: currentOrder > 1 ? [`Step ${currentOrder - 2}`] : []
-        });
+      if (hasFileDependency || hasComponentDependency) {
+        dependencies.push(other.description);
       }
     }
 
-    // Add testing step
-    if (improvements.length > 0) {
-      steps.push({
-        order: currentOrder++,
-        description: 'Test all enhancements and verify functionality',
-        estimated_time_minutes: improvements.length * 15,
-        dependencies: steps.slice(0, -1).map(s => `Step ${s.order}`)
-      });
-    }
-
-    return steps;
+    return dependencies;
   }
 
-  private async validateEnhancements(
-    projectPath: string,
-    result: EnhancementResult
-  ): Promise<EnhancementResult> {
-    const validatedImprovements: Enhancement[] = [];
+  private optimizeImplementationOrder(steps: ImplementationStep[]): ImplementationStep[] {
+    // Simple topological sort based on dependencies
+    const optimized: ImplementationStep[] = [];
+    const remaining = [...steps];
 
-    for (const improvement of result.improvements || []) {
-      let isValid = true;
-      const validatedChanges: CodeChange[] = [];
-
-      for (const change of improvement.code_changes) {
-        // Check if file exists
-        const filePath = path.join(projectPath, change.file_path);
-        try {
-          await fs.access(filePath);
-          
-          // Read current content for modification validation
-          const currentContent = await fs.readFile(filePath, 'utf-8');
-          
-          // Validate change can be applied
-          if (change.change_type === 'modify' && change.original_code) {
-            if (currentContent.includes(change.original_code)) {
-              validatedChanges.push(change);
-            } else {
-              await this.logger.warn('improver', 'Original code not found for modification', {
-                file_path: change.file_path,
-                original_code: change.original_code.substring(0, 100)
-              });
-              isValid = false;
-            }
-          } else {
-            validatedChanges.push(change);
-          }
-        } catch (error) {
-          await this.logger.warn('improver', 'File not found for enhancement', {
-            file_path: change.file_path,
-            change_type: change.change_type
-          });
-          isValid = false;
-        }
-      }
-
-      if (isValid && validatedChanges.length > 0) {
-        validatedImprovements.push({
-          ...improvement,
-          code_changes: validatedChanges
-        });
-      }
-    }
-
-    return {
-      ...result,
-      improvements: validatedImprovements
-    };
-  }
-
-  private async storeEnhancementInsights(
-    projectId: string,
-    enhancementResult: EnhancementResult,
-    scanResults: ScanResult
-  ): Promise<void> {
-    try {
-      // Store overall enhancement success
-      const uxImprovement = (enhancementResult.ux_score_after || 0) - (enhancementResult.ux_score_before || 0);
-      await this.memory.storeSuccess(
-        projectId,
-        `UX enhancement completed`,
-        `Generated ${enhancementResult.improvements?.length || 0} improvements with ${uxImprovement} point UX score increase`,
-        {
-          improvements_count: enhancementResult.improvements?.length || 0,
-          ux_score_before: enhancementResult.ux_score_before,
-          ux_score_after: enhancementResult.ux_score_after,
-          ux_improvement: uxImprovement,
-          enhancement_date: new Date().toISOString()
-        },
-        8
+    while (remaining.length > 0) {
+      const independent = remaining.filter(step =>
+        step.dependencies.every(dep =>
+          optimized.some(completed => completed.description.includes(dep))
+        )
       );
 
-      // Store successful enhancement patterns
-      const highImpactImprovements = enhancementResult.improvements?.filter(
+      if (independent.length === 0) {
+        // Circular dependency or no clear order - just take the first one
+        optimized.push(remaining.shift()!);
+      } else {
+        // Sort independent steps by estimated time (quick wins first)
+        independent.sort((a, b) => a.estimated_time_minutes - b.estimated_time_minutes);
+        optimized.push(independent[0]);
+        const index = remaining.indexOf(independent[0]);
+        remaining.splice(index, 1);
+      }
+    }
+
+    // Update order numbers
+    optimized.forEach((step, index) => {
+      step.order = index + 1;
+    });
+
+    return optimized;
+  }
+
+  private calculateUXScores(scanResults: ScanResult, improvements: Enhancement[]): { before: number; after: number } {
+    // Calculate current UX score based on scan results
+    let beforeScore = 5; // Base score
+
+    // Adjust based on issues
+    const criticalIssues = scanResults.issues.filter(issue => issue.severity === 'critical').length;
+    const highIssues = scanResults.issues.filter(issue => issue.severity === 'high').length;
+    const accessibilityIssues = scanResults.issues.filter(issue => issue.type === 'accessibility').length;
+    const performanceIssues = scanResults.issues.filter(issue => issue.type === 'performance').length;
+
+    beforeScore -= criticalIssues * 1.5;
+    beforeScore -= highIssues * 1.0;
+    beforeScore -= accessibilityIssues * 0.8;
+    beforeScore -= performanceIssues * 0.6;
+
+    // Adjust based on complexity and maintainability
+    if (scanResults.structure_analysis.complexity_score > 7) {
+      beforeScore -= 1;
+    }
+    
+    if (scanResults.metrics.maintainability_index < 50) {
+      beforeScore -= 1;
+    }
+
+    // Calculate after score based on improvements
+    let afterScore = beforeScore;
+
+    improvements.forEach(improvement => {
+      const uxImpact = improvement.impact_assessment.user_experience;
+      const performanceImpact = improvement.impact_assessment.performance_impact;
+      
+      // Add UX improvement (scaled down to prevent over-optimistic scores)
+      afterScore += (uxImpact - 5) * 0.3; // UX impact relative to baseline (5)
+      afterScore += performanceImpact * 0.2; // Performance impact
+    });
+
+    // Clamp scores between 1 and 10
+    beforeScore = Math.max(1, Math.min(10, beforeScore));
+    afterScore = Math.max(1, Math.min(10, afterScore));
+
+    return {
+      before: Math.round(beforeScore * 10) / 10,
+      after: Math.round(afterScore * 10) / 10
+    };
+  }
+
+  private async storeImprovementInsights(projectId: string, enhancementResult: EnhancementResult): Promise<void> {
+    try {
+      // Store overall improvement insight
+      await this.memoryManager.storeInsight(
+        projectId,
+        `UX enhancement analysis completed with ${enhancementResult.improvements.length} improvements`,
+        {
+          improvements_count: enhancementResult.improvements.length,
+          ux_score_before: enhancementResult.ux_score_before,
+          ux_score_after: enhancementResult.ux_score_after,
+          score_improvement: enhancementResult.ux_score_after - enhancementResult.ux_score_before,
+          implementation_steps: enhancementResult.implementation_plan.length
+        },
+        8 // High importance
+      );
+
+      // Store successful improvement patterns
+      const highImpactImprovements = enhancementResult.improvements.filter(
         imp => imp.impact_assessment.user_experience >= 7
-      ) || [];
+      );
 
       for (const improvement of highImpactImprovements) {
-        await this.memory.storePattern(
+        await this.memoryManager.storeSuccess(
           projectId,
-          `Successful ${improvement.enhancement_type} enhancement`,
-          [improvement.description],
-          1,
+          `UX improvement: ${improvement.enhancement_type}`,
+          improvement.description,
+          {
+            user_experience_score: improvement.impact_assessment.user_experience,
+            performance_impact: improvement.impact_assessment.performance_impact,
+            maintainability: improvement.impact_assessment.maintainability,
+            implementation_effort: improvement.impact_assessment.implementation_effort
+          },
           7
         );
       }
 
-      // Store preferences based on enhancement choices
-      const enhancementTypes = enhancementResult.improvements?.map(i => i.enhancement_type) || [];
-      const typeCount = enhancementTypes.reduce((count, type) => {
-        count[type] = (count[type] || 0) + 1;
-        return count;
-      }, {} as Record<string, number>);
+      // Store preferences based on improvement focus
+      const improvementTypes = enhancementResult.improvements.map(imp => imp.enhancement_type);
+      const typeFrequency: Record<string, number> = {};
 
-      for (const [type, count] of Object.entries(typeCount)) {
-        if (count >= 2) { // If multiple improvements of same type, consider it a preference
-          await this.memory.storePreference(
+      improvementTypes.forEach(type => {
+        typeFrequency[type] = (typeFrequency[type] || 0) + 1;
+      });
+
+      for (const [type, frequency] of Object.entries(typeFrequency)) {
+        if (frequency >= 2) { // Store as preference if it appears multiple times
+          await this.memoryManager.storePreference(
             projectId,
-            `enhancement_focus`,
+            `preferred_improvement_type`,
             type,
-            `User frequently chooses ${type} improvements (${count} times in this session)`,
-            6
+            `This improvement type was suggested ${frequency} times in recent analysis`,
+            5
           );
         }
       }
 
-    } catch (error) {
-      await this.logger.warn('improver', 'Failed to store enhancement insights', {
-        project_id: projectId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
+      // Store implementation patterns
+      const avgEffort = enhancementResult.improvements.reduce(
+        (sum, imp) => sum + imp.impact_assessment.implementation_effort, 0
+      ) / enhancementResult.improvements.length;
 
-  async enhanceSpecificComponent(
-    projectPath: string,
-    projectId: string,
-    componentPath: string,
-    focusAreas: string[]
-  ): Promise<EnhancementResult> {
-    await this.logger.info('improver', `Enhancing specific component: ${componentPath}`, {
-      project_id: projectId,
-      component_path: componentPath,
-      focus_areas: focusAreas
-    });
-
-    try {
-      // Read component file
-      const fullPath = path.join(projectPath, componentPath);
-      const componentContent = await fs.readFile(fullPath, 'utf-8');
-
-      // Build component-specific context
-      let context = `Component Enhancement Context:\n\n`;
-      context += `Component: ${componentPath}\n`;
-      context += `Focus Areas: ${focusAreas.join(', ')}\n\n`;
-      context += `Current Code:\n${componentContent}\n\n`;
-
-      // Get component-specific memories
-      const relevantMemories = await this.memory.searchMemories(
+      await this.memoryManager.storePattern(
         projectId,
-        `component ${path.basename(componentPath, path.extname(componentPath))}`,
-        undefined,
-        5
+        `Implementation effort pattern`,
+        [`Average effort: ${avgEffort.toFixed(1)}/10`, `Total improvements: ${enhancementResult.improvements.length}`],
+        1,
+        6
       );
 
-      if (relevantMemories.length > 0) {
-        context += `Relevant Past Insights:\n`;
-        relevantMemories.forEach(memory => {
-          context += `- ${memory.memory_type}: ${JSON.stringify(memory.content).substring(0, 200)}...\n`;
-        });
-      }
-
-      // Create mock scan results for this component
-      const componentScanResults = {
-        structure_analysis: {
-          file_count: 1,
-          component_count: 1,
-          complexity_score: this.calculateComponentComplexity(componentContent),
-          architecture_patterns: [],
-          dependencies: []
-        },
-        issues: [],
-        opportunities: focusAreas.map(area => ({
-          type: area as any,
-          impact: 'medium' as const,
-          effort: 'medium' as const,
-          description: `Improve ${area} in this component`,
-          implementation_suggestion: `Focus on ${area} enhancements`
-        })),
-        metrics: {
-          lines_of_code: componentContent.split('\n').length,
-          cyclomatic_complexity: 1,
-          maintainability_index: 5
-        }
-      };
-
-      // Get AI enhancement for specific component
-      const aiRequest = AIClient.getImproverPrompt(componentScanResults, context);
-      const aiResponse = await this.aiClient.generateResponse(aiRequest);
-
-      const enhancementResult: EnhancementResult = JSON.parse(aiResponse.content);
-
-      // Validate that all changes are for the target component
-      const validatedResult = {
-        ...enhancementResult,
-        improvements: enhancementResult.improvements?.map(improvement => ({
-          ...improvement,
-          code_changes: improvement.code_changes.filter(change => 
-            change.file_path === componentPath || change.file_path === `./${componentPath}`
-          )
-        })).filter(improvement => improvement.code_changes.length > 0) || []
-      };
-
-      await this.logger.info('improver', 'Component enhancement completed', {
-        project_id: projectId,
-        component_path: componentPath,
-        improvements_count: validatedResult.improvements?.length || 0
-      });
-
-      return validatedResult;
-
     } catch (error) {
-      await this.logger.error('improver', 'Component enhancement failed', {
+      await this.logger.warn('improver', 'Failed to store improvement insights', {
         project_id: projectId,
-        component_path: componentPath,
         error: error instanceof Error ? error.message : String(error)
       });
-      throw error;
     }
   }
 
-  private calculateComponentComplexity(content: string): number {
-    let complexity = 1; // Base complexity
-    
-    // Count conditions, loops, and other complexity indicators
-    const conditions = (content.match(/\b(if|else if|switch|case|\?|&&|\|\|)\b/g) || []).length;
-    const loops = (content.match(/\b(for|while|forEach|map|filter|reduce)\b/g) || []).length;
-    const functions = (content.match(/\b(function|const\s+\w+\s*=|=>\s*{|\w+\s*\()/g) || []).length;
-    const hooks = (content.match(/\buse[A-Z]\w*/g) || []).length;
-    
-    complexity += Math.min(conditions * 0.5, 3);
-    complexity += Math.min(loops * 0.3, 2);
-    complexity += Math.min(functions * 0.2, 2);
-    complexity += Math.min(hooks * 0.1, 1);
-    
-    return Math.min(10, Math.max(1, Math.round(complexity)));
-  }
+  // Utility method to apply improvements (for future use)
+  async applyImprovement(improvement: Enhancement, dryRun: boolean = true): Promise<boolean> {
+    try {
+      await this.logger.info('improver', `${dryRun ? 'Simulating' : 'Applying'} improvement`, {
+        component: improvement.component_path,
+        type: improvement.enhancement_type,
+        changes: improvement.code_changes.length
+      });
 
-  async applyEnhancements(
-    projectPath: string,
-    projectId: string,
-    enhancementResult: EnhancementResult,
-    options: {
-      dryRun?: boolean;
-      backupOriginals?: boolean;
-    } = {}
-  ): Promise<{ applied: number; failed: number; details: any[] }> {
-    await this.logger.info('improver', 'Applying enhancements', {
-      project_id: projectId,
-      improvements_count: enhancementResult.improvements?.length || 0,
-      dry_run: options.dryRun || false
-    });
-
-    const results = {
-      applied: 0,
-      failed: 0,
-      details: [] as any[]
-    };
-
-    if (!enhancementResult.improvements) {
-      return results;
-    }
-
-    for (const improvement of enhancementResult.improvements) {
       for (const change of improvement.code_changes) {
-        try {
-          const filePath = path.join(projectPath, change.file_path);
-          
-          if (options.dryRun) {
-            // Just validate the change
-            await this.validateSingleChange(filePath, change);
-            results.applied++;
-            results.details.push({
-              success: true,
-              file: change.file_path,
-              type: change.change_type,
-              message: 'Validation successful (dry run)'
-            });
-          } else {
-            // Create backup if requested
-            if (options.backupOriginals) {
-              await this.createBackup(filePath);
-            }
-
-            // Apply the change
-            await this.applySingleChange(filePath, change);
-            results.applied++;
-            results.details.push({
-              success: true,
-              file: change.file_path,
-              type: change.change_type,
-              message: 'Applied successfully'
-            });
-          }
-        } catch (error) {
-          results.failed++;
-          results.details.push({
-            success: false,
-            file: change.file_path,
-            type: change.change_type,
-            error: error instanceof Error ? error.message : String(error)
-          });
-
-          await this.logger.warn('improver', 'Failed to apply enhancement', {
-            file_path: change.file_path,
+        if (!dryRun) {
+          // In a real implementation, this would apply the code changes
+          // For now, we just log what would be done
+          await this.logger.info('improver', `Would apply change to ${change.file_path}`, {
             change_type: change.change_type,
-            error: error instanceof Error ? error.message : String(error)
+            line_number: change.line_number
           });
         }
       }
+
+      return true;
+
+    } catch (error) {
+      await this.logger.error('improver', 'Failed to apply improvement', {
+        component: improvement.component_path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return false;
     }
-
-    await this.logger.info('improver', 'Enhancement application completed', {
-      project_id: projectId,
-      applied: results.applied,
-      failed: results.failed,
-      dry_run: options.dryRun || false
-    });
-
-    return results;
-  }
-
-  private async validateSingleChange(filePath: string, change: CodeChange): Promise<void> {
-    await fs.access(filePath); // Check file exists
-    
-    if (change.change_type === 'modify' && change.original_code) {
-      const content = await fs.readFile(filePath, 'utf-8');
-      if (!content.includes(change.original_code)) {
-        throw new Error('Original code not found in file');
-      }
-    }
-  }
-
-  private async applySingleChange(filePath: string, change: CodeChange): Promise<void> {
-    switch (change.change_type) {
-      case 'modify':
-        if (!change.original_code) {
-          throw new Error('Original code required for modification');
-        }
-        const content = await fs.readFile(filePath, 'utf-8');
-        const updatedContent = content.replace(change.original_code, change.new_code);
-        await fs.writeFile(filePath, updatedContent, 'utf-8');
-        break;
-
-      case 'add':
-        // For add operations, append to file or insert at specific line
-        let existingContent = await fs.readFile(filePath, 'utf-8');
-        if (change.line_number) {
-          const lines = existingContent.split('\n');
-          lines.splice(change.line_number - 1, 0, change.new_code);
-          existingContent = lines.join('\n');
-        } else {
-          existingContent += '\n' + change.new_code;
-        }
-        await fs.writeFile(filePath, existingContent, 'utf-8');
-        break;
-
-      case 'delete':
-        if (!change.original_code) {
-          throw new Error('Original code required for deletion');
-        }
-        const deleteContent = await fs.readFile(filePath, 'utf-8');
-        const deletedContent = deleteContent.replace(change.original_code, '');
-        await fs.writeFile(filePath, deletedContent, 'utf-8');
-        break;
-
-      default:
-        throw new Error(`Unsupported change type: ${change.change_type}`);
-    }
-  }
-
-  private async createBackup(filePath: string): Promise<void> {
-    const backupPath = `${filePath}.backup.${Date.now()}`;
-    await fs.copyFile(filePath, backupPath);
   }
 }

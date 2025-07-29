@@ -1,388 +1,482 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import { ScanResult, StructureAnalysis, CodeIssue, Opportunity, CodeMetrics, Dependency } from '../../types';
+import { ScanResult, StructureAnalysis, CodeIssue, Opportunity, CodeMetrics, Task } from '../../types';
 import { Logger } from '../logger/logger';
-import { MemoryManager } from '../memory/memoryManager';
 import { AIClient } from '../engines/AIClient';
+import { MemoryManager } from '../memory/memoryManager';
+import { TaskManager } from '../tasks/taskManager';
 
-export class Scanner {
+export class ScannerAgent {
   private logger: Logger;
-  private memory: MemoryManager;
   private aiClient: AIClient;
+  private memoryManager: MemoryManager;
+  private taskManager: TaskManager;
 
-  constructor(logger: Logger, memory: MemoryManager, aiClient: AIClient) {
+  constructor(
+    logger: Logger,
+    aiClient: AIClient,
+    memoryManager: MemoryManager,
+    taskManager: TaskManager
+  ) {
     this.logger = logger;
-    this.memory = memory;
     this.aiClient = aiClient;
+    this.memoryManager = memoryManager;
+    this.taskManager = taskManager;
   }
 
-  async scanProject(
-    projectPath: string,
-    projectId: string,
-    options: {
-      includePatterns?: string[];
-      excludePatterns?: string[];
-      maxFileSize?: number;
-    } = {}
-  ): Promise<ScanResult> {
-    await this.logger.info('scanner', `Starting project scan: ${projectPath}`, {
-      project_path: projectPath,
-      project_id: projectId
+  async executeTask(task: Task): Promise<ScanResult> {
+    await this.logger.info('scanner', 'Starting scan task', {
+      task_id: task.id,
+      project_id: task.project_id
     });
 
     try {
-      // Get file structure
-      const filePaths = await this.getProjectFiles(projectPath, options);
+      // Extract scan parameters from task input
+      const { projectPath, filePatterns, excludePatterns } = task.input_data;
       
-      // Analyze project structure
-      const structureAnalysis = await this.analyzeStructure(filePaths, projectPath);
-      
-      // Get relevant memories for context
-      const relevantMemories = await this.memory.getRelevantMemories(
-        projectId,
-        `project scan ${path.basename(projectPath)}`,
-        'scan',
-        5
+      // Set context for logging
+      this.logger.setContext(task.project_id, task.id);
+
+      // Start the task
+      await this.taskManager.startTask(task.id);
+
+      // Step 1: Discover project structure
+      const projectFiles = await this.discoverProjectStructure(
+        projectPath || process.cwd(),
+        filePatterns || ['**/*.{ts,tsx,js,jsx,css,scss,json}'],
+        excludePatterns || ['node_modules/**', 'dist/**', '.git/**']
       );
 
-      // Prepare context for AI analysis
-      const projectContext = await this.buildProjectContext(filePaths, projectPath, relevantMemories);
+      await this.logger.info('scanner', `Discovered ${projectFiles.length} files`, {
+        file_count: projectFiles.length,
+        patterns: filePatterns
+      });
 
-      // Use AI to analyze the codebase
-      const aiRequest = AIClient.getScannerPrompt(filePaths, projectContext);
-      const aiResponse = await this.aiClient.generateResponse(aiRequest);
+      // Step 2: Analyze project structure
+      const structureAnalysis = await this.analyzeProjectStructure(projectFiles, projectPath);
 
-      let scanResults: ScanResult;
-      try {
-        scanResults = JSON.parse(aiResponse.content);
-      } catch (error) {
-        await this.logger.error('scanner', 'Failed to parse AI scan results', {
-          ai_content: aiResponse.content.substring(0, 500),
-          error: error instanceof Error ? error.message : String(error)
-        });
-        throw new Error('Invalid AI response format');
-      }
+      // Step 3: Perform detailed code analysis using Claude
+      const codeAnalysis = await this.performCodeAnalysis(projectFiles, structureAnalysis);
 
-      // Enhance results with our own analysis
-      scanResults.structure_analysis = {
-        ...scanResults.structure_analysis,
-        ...structureAnalysis
+      // Step 4: Generate metrics
+      const metrics = await this.calculateMetrics(projectFiles);
+
+      // Step 5: Compile scan results
+      const scanResult: ScanResult = {
+        structure_analysis: structureAnalysis,
+        issues: codeAnalysis.issues,
+        opportunities: codeAnalysis.opportunities,
+        metrics
       };
 
       // Store insights in memory
-      await this.storeAnalysisInsights(projectId, scanResults, filePaths);
+      await this.storeAnalysisInsights(task.project_id, scanResult);
 
-      await this.logger.info('scanner', 'Project scan completed', {
-        project_id: projectId,
-        files_analyzed: filePaths.length,
-        issues_found: scanResults.issues?.length || 0,
-        opportunities_found: scanResults.opportunities?.length || 0,
-        tokens_used: aiResponse.tokens_used,
-        cost: aiResponse.cost_estimate
+      // Complete the task
+      await this.taskManager.completeTask(
+        task.id,
+        { scan_result: scanResult },
+        codeAnalysis.tokensUsed,
+        codeAnalysis.costEstimate
+      );
+
+      await this.logger.info('scanner', 'Scan task completed successfully', {
+        task_id: task.id,
+        issues_found: scanResult.issues.length,
+        opportunities_found: scanResult.opportunities.length,
+        complexity_score: scanResult.structure_analysis.complexity_score
       });
 
-      return scanResults;
+      return scanResult;
 
     } catch (error) {
-      await this.logger.error('scanner', 'Project scan failed', {
+      await this.logger.error('scanner', 'Scan task failed', {
+        task_id: task.id,
+        error: error instanceof Error ? error.message : String(error)
+      }, error instanceof Error ? error : undefined);
+
+      await this.taskManager.failTask(
+        task.id,
+        error instanceof Error ? error.message : String(error),
+        error instanceof Error ? error.stack : undefined
+      );
+
+      throw error;
+    }
+  }
+
+  private async discoverProjectStructure(
+    projectPath: string,
+    includePatterns: string[],
+    excludePatterns: string[]
+  ): Promise<string[]> {
+    const files: string[] = [];
+    
+    try {
+      const entries = await fs.readdir(projectPath, { withFileTypes: true });
+      
+      for (const entry of entries) {
+        const fullPath = path.join(projectPath, entry.name);
+        const relativePath = path.relative(process.cwd(), fullPath);
+        
+        // Check exclude patterns
+        if (this.shouldExclude(relativePath, excludePatterns)) {
+          continue;
+        }
+        
+        if (entry.isDirectory()) {
+          // Recursively scan subdirectories
+          const subFiles = await this.discoverProjectStructure(
+            fullPath,
+            includePatterns,
+            excludePatterns
+          );
+          files.push(...subFiles);
+        } else if (entry.isFile()) {
+          // Check include patterns
+          if (this.shouldInclude(relativePath, includePatterns)) {
+            files.push(relativePath);
+          }
+        }
+      }
+      
+      return files;
+    } catch (error) {
+      await this.logger.error('scanner', 'Failed to discover project structure', {
         project_path: projectPath,
-        project_id: projectId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return [];
+    }
+  }
+
+  private shouldInclude(filePath: string, patterns: string[]): boolean {
+    // Simple glob-like pattern matching
+    return patterns.some(pattern => {
+      const regex = new RegExp(
+        pattern
+          .replace(/\*\*/g, '.*')
+          .replace(/\*/g, '[^/]*')
+          .replace(/\./g, '\\.')
+      );
+      return regex.test(filePath);
+    });
+  }
+
+  private shouldExclude(filePath: string, patterns: string[]): boolean {
+    return patterns.some(pattern => {
+      const regex = new RegExp(
+        pattern
+          .replace(/\*\*/g, '.*')
+          .replace(/\*/g, '[^/]*')
+          .replace(/\./g, '\\.')
+      );
+      return regex.test(filePath);
+    });
+  }
+
+  private async analyzeProjectStructure(files: string[], projectPath?: string): Promise<StructureAnalysis> {
+    try {
+      const analysis: StructureAnalysis = {
+        file_count: files.length,
+        component_count: 0,
+        complexity_score: 0,
+        architecture_patterns: [],
+        dependencies: []
+      };
+
+      // Count components (React/Vue/Angular files)
+      analysis.component_count = files.filter(file => 
+        /\.(tsx|jsx|vue)$/.test(file) || 
+        file.includes('component') || 
+        file.includes('Component')
+      ).length;
+
+      // Analyze package.json for dependencies
+      const packageJsonPath = path.join(projectPath || process.cwd(), 'package.json');
+      try {
+        const packageJsonContent = await fs.readFile(packageJsonPath, 'utf-8');
+        const packageJson = JSON.parse(packageJsonContent);
+        
+        // Extract dependencies
+        const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
+        analysis.dependencies = Object.entries(deps).map(([name, version]) => ({
+          name,
+          version: version as string,
+          type: packageJson.dependencies?.[name] ? 'production' : 'development'
+        }));
+
+        // Detect architecture patterns
+        if (deps.react) analysis.architecture_patterns.push('React');
+        if (deps.vue) analysis.architecture_patterns.push('Vue');
+        if (deps['@angular/core']) analysis.architecture_patterns.push('Angular');
+        if (deps.typescript) analysis.architecture_patterns.push('TypeScript');
+        if (deps.tailwindcss) analysis.architecture_patterns.push('Tailwind CSS');
+        if (deps.express) analysis.architecture_patterns.push('Express.js');
+        if (deps.next) analysis.architecture_patterns.push('Next.js');
+        if (deps.vite) analysis.architecture_patterns.push('Vite');
+
+      } catch (error) {
+        await this.logger.warn('scanner', 'Could not read package.json', {
+          package_json_path: packageJsonPath
+        });
+      }
+
+      // Calculate basic complexity score
+      analysis.complexity_score = this.calculateComplexityScore(files, analysis);
+
+      return analysis;
+    } catch (error) {
+      await this.logger.error('scanner', 'Failed to analyze project structure', {
         error: error instanceof Error ? error.message : String(error)
       });
       throw error;
     }
   }
 
-  private async getProjectFiles(
-    projectPath: string,
-    options: {
-      includePatterns?: string[];
-      excludePatterns?: string[];
-      maxFileSize?: number;
-    }
-  ): Promise<string[]> {
-    const defaultExcludePatterns = [
-      'node_modules',
-      '.git',
-      'dist',
-      'build',
-      '.next',
-      'coverage',
-      '.nyc_output',
-      '*.log',
-      '.DS_Store',
-      'Thumbs.db'
-    ];
-
-    const excludePatterns = [...defaultExcludePatterns, ...(options.excludePatterns || [])];
-    const includePatterns = options.includePatterns || [
-      '*.ts', '*.tsx', '*.js', '*.jsx', '*.vue', '*.svelte',
-      '*.css', '*.scss', '*.sass', '*.less',
-      '*.json', '*.md', '*.html', '*.xml'
-    ];
-    const maxFileSize = (options.maxFileSize || 10) * 1024 * 1024; // Convert MB to bytes
-
-    const files: string[] = [];
-
-    async function walkDir(dirPath: string): Promise<void> {
-      try {
-        const entries = await fs.readdir(dirPath, { withFileTypes: true });
-
-        for (const entry of entries) {
-          const fullPath = path.join(dirPath, entry.name);
-          const relativePath = path.relative(projectPath, fullPath);
-
-          // Check exclude patterns
-          if (excludePatterns.some(pattern => 
-            relativePath.includes(pattern) || entry.name.includes(pattern)
-          )) {
-            continue;
-          }
-
-          if (entry.isDirectory()) {
-            await walkDir(fullPath);
-          } else if (entry.isFile()) {
-            // Check include patterns
-            const matchesInclude = includePatterns.some(pattern => {
-              if (pattern.startsWith('*.')) {
-                return entry.name.endsWith(pattern.substring(1));
-              }
-              return entry.name.includes(pattern);
-            });
-
-            if (matchesInclude) {
-              // Check file size
-              const stats = await fs.stat(fullPath);
-              if (stats.size <= maxFileSize) {
-                files.push(relativePath);
-              }
-            }
-          }
-        }
-      } catch (error) {
-        // Skip directories we can't read
-        await this.logger.debug('scanner', `Skipped unreadable directory: ${dirPath}`, {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
-    }
-
-    await walkDir(projectPath);
-    return files;
+  private calculateComplexityScore(files: string[], analysis: StructureAnalysis): number {
+    let score = 0;
+    
+    // Base score from file count
+    score += Math.min(files.length / 100, 5); // Up to 5 points for file count
+    
+    // Component complexity
+    score += Math.min(analysis.component_count / 20, 3); // Up to 3 points for components
+    
+    // Dependency complexity
+    score += Math.min(analysis.dependencies.length / 50, 2); // Up to 2 points for dependencies
+    
+    // Clamp between 1-10
+    return Math.max(1, Math.min(10, Math.round(score)));
   }
 
-  private async analyzeStructure(filePaths: string[], projectPath: string): Promise<StructureAnalysis> {
-    const analysis: StructureAnalysis = {
-      file_count: filePaths.length,
-      component_count: 0,
-      complexity_score: 0,
-      architecture_patterns: [],
-      dependencies: []
-    };
-
-    // Count components (rough heuristic)
-    const componentFiles = filePaths.filter(file => 
-      /\.(tsx?|jsx?|vue|svelte)$/.test(file) && 
-      !file.includes('.test.') && 
-      !file.includes('.spec.')
-    );
-    analysis.component_count = componentFiles.length;
-
-    // Detect architecture patterns
-    if (filePaths.some(f => f.includes('components'))) {
-      analysis.architecture_patterns.push('Component-based');
-    }
-    if (filePaths.some(f => f.includes('pages') || f.includes('routes'))) {
-      analysis.architecture_patterns.push('Route-based');
-    }
-    if (filePaths.some(f => f.includes('store') || f.includes('redux'))) {
-      analysis.architecture_patterns.push('State management');
-    }
-    if (filePaths.some(f => f.includes('api') || f.includes('services'))) {
-      analysis.architecture_patterns.push('Service layer');
-    }
-    if (filePaths.some(f => f.includes('hooks'))) {
-      analysis.architecture_patterns.push('Custom hooks');
-    }
-
-    // Analyze package.json for dependencies
-    const packageJsonPath = path.join(projectPath, 'package.json');
+  private async performCodeAnalysis(
+    files: string[],
+    structure: StructureAnalysis
+  ): Promise<{ issues: CodeIssue[]; opportunities: Opportunity[]; tokensUsed: number; costEstimate: number }> {
     try {
-      const packageContent = await fs.readFile(packageJsonPath, 'utf-8');
-      const packageJson = JSON.parse(packageContent);
+      // Sample some files for analysis (to manage token usage)
+      const sampleFiles = this.selectFilesForAnalysis(files);
       
-      if (packageJson.dependencies) {
-        Object.entries(packageJson.dependencies).forEach(([name, version]) => {
-          analysis.dependencies.push({
-            name,
-            version: version as string,
-            type: 'production'
-          });
-        });
-      }
+      // Read file contents
+      const fileContents = await Promise.all(
+        sampleFiles.map(async (filePath) => {
+          try {
+            const content = await fs.readFile(filePath, 'utf-8');
+            return { path: filePath, content: content.slice(0, 5000) }; // Limit content size
+          } catch (error) {
+            await this.logger.warn('scanner', `Could not read file: ${filePath}`);
+            return null;
+          }
+        })
+      );
+
+      const validFiles = fileContents.filter(Boolean) as Array<{ path: string; content: string }>;
+
+      // Create context for Claude
+      const projectContext = this.buildProjectContext(structure, validFiles);
       
-      if (packageJson.devDependencies) {
-        Object.entries(packageJson.devDependencies).forEach(([name, version]) => {
-          analysis.dependencies.push({
-            name,
-            version: version as string,
-            type: 'development'
-          });
+      // Get Claude analysis
+      const aiRequest = AIClient.getScannerPrompt(sampleFiles, projectContext);
+      const response = await this.aiClient.generateResponse(aiRequest);
+
+      // Parse Claude's response
+      let analysisResult;
+      try {
+        analysisResult = JSON.parse(response.content);
+      } catch (parseError) {
+        await this.logger.error('scanner', 'Failed to parse Claude response', {
+          response_content: response.content.slice(0, 500)
         });
+        throw new Error('Invalid response format from Claude');
       }
+
+      // Transform Claude's analysis into our format
+      const issues: CodeIssue[] = (analysisResult.issues || []).map((issue: any) => ({
+        type: issue.type || 'maintainability',
+        severity: issue.severity || 'medium',
+        file_path: issue.file_path || '',
+        line_number: issue.line_number,
+        description: issue.description || '',
+        suggestion: issue.suggestion || ''
+      }));
+
+      const opportunities: Opportunity[] = (analysisResult.opportunities || []).map((opp: any) => ({
+        type: opp.type || 'ux_improvement',
+        impact: opp.impact || 'medium',
+        effort: opp.effort || 'medium',
+        description: opp.description || '',
+        implementation_suggestion: opp.implementation_suggestion || ''
+      }));
+
+      return {
+        issues,
+        opportunities,
+        tokensUsed: response.tokens_used,
+        costEstimate: response.cost_estimate
+      };
+
     } catch (error) {
-      await this.logger.debug('scanner', 'Could not read package.json', {
-        path: packageJsonPath,
+      await this.logger.error('scanner', 'Code analysis failed', {
         error: error instanceof Error ? error.message : String(error)
       });
+      
+      // Return empty results on failure
+      return {
+        issues: [],
+        opportunities: [],
+        tokensUsed: 0,
+        costEstimate: 0
+      };
     }
-
-    // Calculate complexity score (1-10)
-    let complexityFactors = 0;
-    
-    if (analysis.file_count > 100) complexityFactors += 2;
-    else if (analysis.file_count > 50) complexityFactors += 1;
-    
-    if (analysis.component_count > 50) complexityFactors += 2;
-    else if (analysis.component_count > 20) complexityFactors += 1;
-    
-    if (analysis.dependencies.length > 50) complexityFactors += 2;
-    else if (analysis.dependencies.length > 20) complexityFactors += 1;
-    
-    if (analysis.architecture_patterns.length > 3) complexityFactors += 1;
-    
-    analysis.complexity_score = Math.min(10, Math.max(1, complexityFactors + 1));
-
-    return analysis;
   }
 
-  private async buildProjectContext(
-    filePaths: string[],
-    projectPath: string,
-    relevantMemories: any[]
-  ): Promise<string> {
+  private selectFilesForAnalysis(files: string[]): string[] {
+    // Prioritize important file types and limit to manage tokens
+    const prioritizedFiles = files
+      .filter(file => {
+        // High priority files
+        if (file.includes('App.') || file.includes('main.') || file.includes('index.')) return true;
+        if (file.endsWith('.tsx') || file.endsWith('.jsx')) return true;
+        if (file.endsWith('.ts') && !file.endsWith('.d.ts')) return true;
+        return false;
+      })
+      .slice(0, 10); // Limit to 10 files
+
+    // Add some regular files if we have space
+    const remainingFiles = files
+      .filter(file => !prioritizedFiles.includes(file))
+      .slice(0, Math.max(0, 15 - prioritizedFiles.length));
+
+    return [...prioritizedFiles, ...remainingFiles];
+  }
+
+  private buildProjectContext(structure: StructureAnalysis, files: Array<{ path: string; content: string }>): string {
     let context = `Project Analysis Context:\n\n`;
     
-    // Basic project info
-    context += `Project Path: ${projectPath}\n`;
-    context += `Total Files: ${filePaths.length}\n\n`;
+    context += `Structure Overview:\n`;
+    context += `- Total Files: ${structure.file_count}\n`;
+    context += `- Components: ${structure.component_count}\n`;
+    context += `- Architecture: ${structure.architecture_patterns.join(', ')}\n`;
+    context += `- Dependencies: ${structure.dependencies.length}\n\n`;
 
-    // File structure overview
-    context += `File Structure:\n`;
-    const directories = new Set();
-    filePaths.forEach(file => {
-      const dir = path.dirname(file);
-      if (dir !== '.') {
-        directories.add(dir);
-      }
-    });
-    
-    directories.forEach(dir => {
-      const fileCount = filePaths.filter(f => f.startsWith(dir)).length;
-      context += `- ${dir}/ (${fileCount} files)\n`;
+    context += `Key Dependencies:\n`;
+    structure.dependencies.slice(0, 10).forEach(dep => {
+      context += `- ${dep.name}@${dep.version} (${dep.type})\n`;
     });
 
-    // Key files
-    const keyFiles = filePaths.filter(file => 
-      ['package.json', 'tsconfig.json', 'next.config.js', 'vite.config.ts', 'webpack.config.js', 'README.md']
-        .some(key => file.includes(key))
-    );
-    
-    if (keyFiles.length > 0) {
-      context += `\nKey Configuration Files:\n`;
-      keyFiles.forEach(file => context += `- ${file}\n`);
-    }
-
-    // Sample of actual file contents for key files
-    try {
-      const packageJsonPath = path.join(projectPath, 'package.json');
-      const packageContent = await fs.readFile(packageJsonPath, 'utf-8');
-      const packageJson = JSON.parse(packageContent);
-      
-      context += `\nPackage.json overview:\n`;
-      context += `- Name: ${packageJson.name || 'Unknown'}\n`;
-      context += `- Version: ${packageJson.version || 'Unknown'}\n`;
-      context += `- Scripts: ${Object.keys(packageJson.scripts || {}).join(', ')}\n`;
-      
-      const mainDeps = Object.keys(packageJson.dependencies || {}).slice(0, 10);
-      if (mainDeps.length > 0) {
-        context += `- Main Dependencies: ${mainDeps.join(', ')}\n`;
-      }
-    } catch (error) {
-      // Continue without package.json context
-    }
-
-    // Relevant memories
-    if (relevantMemories.length > 0) {
-      context += `\nRelevant Past Analysis:\n`;
-      relevantMemories.forEach(memory => {
-        context += `- ${memory.memory_type}: ${JSON.stringify(memory.content).substring(0, 200)}...\n`;
-      });
-    }
+    context += `\nFile Samples:\n`;
+    files.forEach(file => {
+      context += `\n--- ${file.path} ---\n`;
+      context += file.content.slice(0, 1000) + (file.content.length > 1000 ? '\n...' : '');
+    });
 
     return context;
   }
 
-  private async storeAnalysisInsights(
-    projectId: string,
-    scanResults: ScanResult,
-    filePaths: string[]
-  ): Promise<void> {
+  private async calculateMetrics(files: string[]): Promise<CodeMetrics> {
     try {
-      // Store overall analysis insight
-      await this.memory.storeInsight(
+      let totalLoc = 0;
+      let totalComplexity = 0;
+      
+      // Sample files for metrics calculation
+      const sampleFiles = files.slice(0, 20);
+      
+      for (const filePath of sampleFiles) {
+        try {
+          const content = await fs.readFile(filePath, 'utf-8');
+          const lines = content.split('\n').filter(line => line.trim().length > 0);
+          totalLoc += lines.length;
+          
+          // Simple complexity calculation based on control structures
+          const complexityIndicators = (content.match(/\b(if|for|while|switch|catch|function|=>)\b/g) || []).length;
+          totalComplexity += complexityIndicators;
+        } catch (error) {
+          // Skip files that can't be read
+          continue;
+        }
+      }
+
+      const avgComplexity = sampleFiles.length > 0 ? totalComplexity / sampleFiles.length : 0;
+      
+      // Extrapolate to full project
+      const estimatedTotalLoc = Math.round(totalLoc * (files.length / sampleFiles.length));
+      
+      // Calculate maintainability index (simplified version)
+      const maintainabilityIndex = Math.max(0, Math.min(100, 
+        171 - 5.2 * Math.log(Math.max(1, estimatedTotalLoc)) - 0.23 * avgComplexity
+      ));
+
+      return {
+        lines_of_code: estimatedTotalLoc,
+        cyclomatic_complexity: Math.round(avgComplexity),
+        maintainability_index: Math.round(maintainabilityIndex)
+      };
+    } catch (error) {
+      await this.logger.error('scanner', 'Failed to calculate metrics', {
+        error: error instanceof Error ? error.message : String(error)
+      });
+      
+      return {
+        lines_of_code: 0,
+        cyclomatic_complexity: 0,
+        maintainability_index: 0
+      };
+    }
+  }
+
+  private async storeAnalysisInsights(projectId: string, scanResult: ScanResult): Promise<void> {
+    try {
+      // Store key insights
+      await this.memoryManager.storeInsight(
         projectId,
-        `Project structure analysis completed`,
+        `Project scan completed with ${scanResult.issues.length} issues and ${scanResult.opportunities.length} opportunities`,
         {
-          file_count: filePaths.length,
-          complexity_score: scanResults.structure_analysis.complexity_score,
-          architecture_patterns: scanResults.structure_analysis.architecture_patterns,
-          issues_count: scanResults.issues?.length || 0,
-          opportunities_count: scanResults.opportunities?.length || 0,
-          analysis_date: new Date().toISOString()
+          complexity_score: scanResult.structure_analysis.complexity_score,
+          file_count: scanResult.structure_analysis.file_count,
+          component_count: scanResult.structure_analysis.component_count,
+          maintainability_index: scanResult.metrics.maintainability_index
         },
-        7
+        8 // High importance
       );
 
-      // Store patterns found
-      if (scanResults.structure_analysis.architecture_patterns.length > 0) {
-        await this.memory.storePattern(
+      // Store patterns found in architecture
+      if (scanResult.structure_analysis.architecture_patterns.length > 0) {
+        await this.memoryManager.storePattern(
           projectId,
-          `Architecture patterns: ${scanResults.structure_analysis.architecture_patterns.join(', ')}`,
-          scanResults.structure_analysis.architecture_patterns,
+          `Architecture patterns: ${scanResult.structure_analysis.architecture_patterns.join(', ')}`,
+          scanResult.structure_analysis.architecture_patterns,
           1,
           6
         );
       }
 
-      // Store critical issues
-      const criticalIssues = scanResults.issues?.filter(issue => issue.severity === 'critical' || issue.severity === 'high') || [];
+      // Store critical issues as errors
+      const criticalIssues = scanResult.issues.filter(issue => issue.severity === 'critical');
       for (const issue of criticalIssues) {
-        await this.memory.storeError(
+        await this.memoryManager.storeError(
           projectId,
-          `${issue.type}: ${issue.description}`,
+          issue.description,
           issue.suggestion,
-          {
-            file_path: issue.file_path,
-            line_number: issue.line_number,
-            severity: issue.severity
-          },
-          issue.severity === 'critical' ? 9 : 7
+          { file_path: issue.file_path, type: issue.type },
+          9
         );
       }
 
       // Store high-impact opportunities
-      const highImpactOpportunities = scanResults.opportunities?.filter(opp => opp.impact === 'high') || [];
+      const highImpactOpportunities = scanResult.opportunities.filter(opp => opp.impact === 'high');
       for (const opportunity of highImpactOpportunities) {
-        await this.memory.storeSuccess(
+        await this.memoryManager.storeContext(
           projectId,
-          `Optimization opportunity: ${opportunity.type}`,
-          opportunity.description,
+          'improvement_opportunity',
           {
+            type: opportunity.type,
+            description: opportunity.description,
+            implementation_suggestion: opportunity.implementation_suggestion,
             impact: opportunity.impact,
             effort: opportunity.effort
           },
-          8
+          7
         );
       }
 
@@ -391,68 +485,6 @@ export class Scanner {
         project_id: projectId,
         error: error instanceof Error ? error.message : String(error)
       });
-    }
-  }
-
-  async scanSpecificFiles(
-    projectPath: string,
-    projectId: string,
-    targetFiles: string[]
-  ): Promise<ScanResult> {
-    await this.logger.info('scanner', `Scanning specific files`, {
-      project_id: projectId,
-      file_count: targetFiles.length,
-      files: targetFiles
-    });
-
-    try {
-      // Read file contents for detailed analysis
-      const fileContents: Record<string, string> = {};
-      for (const filePath of targetFiles) {
-        try {
-          const fullPath = path.join(projectPath, filePath);
-          const content = await fs.readFile(fullPath, 'utf-8');
-          fileContents[filePath] = content;
-        } catch (error) {
-          await this.logger.warn('scanner', `Could not read file: ${filePath}`, {
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-      }
-
-      // Build detailed context with file contents
-      let context = `Detailed File Analysis:\n\n`;
-      Object.entries(fileContents).forEach(([filePath, content]) => {
-        context += `=== ${filePath} ===\n`;
-        context += content.substring(0, 2000); // Limit content to avoid token limits
-        if (content.length > 2000) {
-          context += '\n... (content truncated)';
-        }
-        context += '\n\n';
-      });
-
-      // Get AI analysis
-      const aiRequest = AIClient.getScannerPrompt(targetFiles, context);
-      const aiResponse = await this.aiClient.generateResponse(aiRequest);
-
-      const scanResults: ScanResult = JSON.parse(aiResponse.content);
-
-      await this.logger.info('scanner', 'Specific file scan completed', {
-        project_id: projectId,
-        files_analyzed: targetFiles.length,
-        issues_found: scanResults.issues?.length || 0,
-        opportunities_found: scanResults.opportunities?.length || 0
-      });
-
-      return scanResults;
-
-    } catch (error) {
-      await this.logger.error('scanner', 'Specific file scan failed', {
-        project_id: projectId,
-        target_files: targetFiles,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      throw error;
     }
   }
 }

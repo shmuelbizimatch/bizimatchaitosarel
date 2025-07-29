@@ -38,10 +38,10 @@ export interface TaskMetadata {
   priority: number;
   estimated_duration_ms?: number;
   actual_duration_ms?: number;
-  retry_count: number;
-  ai_engine: AIEngine;
   tokens_used?: number;
   cost_estimate?: number;
+  retry_count: number;
+  ai_engine: AIEngine;
 }
 
 // Memory System
