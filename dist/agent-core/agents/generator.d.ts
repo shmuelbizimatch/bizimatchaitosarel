@@ -1,0 +1,42 @@
+import { ModuleGenerationResult, Task } from '../../types';
+import { AIClient } from '../engines/AIClient';
+import { Logger } from '../logger/logger';
+import { MemoryManager } from '../memory/memoryManager';
+export declare class GeneratorAgent {
+    private aiClient;
+    private logger;
+    private memoryManager;
+    constructor(aiClient: AIClient, logger: Logger, memoryManager: MemoryManager);
+    generate(task: Task): Promise<ModuleGenerationResult>;
+    private analyzeExistingPatterns;
+    private extractComponentPatterns;
+    private extractServicePatterns;
+    private extractUtilityPatterns;
+    private analyzeNamingConventions;
+    private analyzeFolderStructure;
+    private detectStylingApproach;
+    private detectStateManagement;
+    private detectTestingFramework;
+    private checkForFiles;
+    private gatherProjectContext;
+    private generateAIModules;
+    private createFallbackGeneration;
+    private generateBasicComponent;
+    private generateBasicService;
+    private generateBasicUtility;
+    private extractComponentName;
+    private extractServiceName;
+    private extractUtilityName;
+    private generateComponentTest;
+    private generateServiceTest;
+    private generateUtilityTest;
+    private enhanceGeneratedModules;
+    private toPascalCase;
+    private applyStylingPattern;
+    private addConsistentImports;
+    private adjustFilePath;
+    private createIntegrationInstructions;
+    private createTestingSuggestions;
+    private storeGenerationInsights;
+}
+//# sourceMappingURL=generator.d.ts.map
