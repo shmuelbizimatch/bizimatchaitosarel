@@ -4,10 +4,8 @@ import {
   ExecutionMode, 
   AIEngine, 
   LogEntry, 
-  AgentProgress,
-  Task,
-  AgentType 
-} from '../../../types';
+  AgentProgress
+} from '../types';
 
 interface AgentPanelProps {
   className?: string;
@@ -70,6 +68,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   useEffect(() => {
     loadCapabilities();
     loadStats();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-refresh progress and logs when running
@@ -82,6 +81,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
       return () => clearInterval(interval);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.isRunning]);
 
   const loadCapabilities = useCallback(async () => {
@@ -110,7 +110,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     if (onGetProgress) {
       try {
         const progress = await onGetProgress();
-        setState(prev => ({ ...prev, progress }));
+        setState((prev: AgentPanelState) => ({ ...prev, progress }));
       } catch (error) {
         console.error('Failed to refresh progress:', error);
       }
@@ -121,7 +121,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     if (onGetLogs) {
       try {
         const logs = await onGetLogs(50);
-        setState(prev => ({ ...prev, logs }));
+        setState((prev: AgentPanelState) => ({ ...prev, logs }));
       } catch (error) {
         console.error('Failed to refresh logs:', error);
       }
@@ -139,7 +139,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       return;
     }
 
-    setState(prev => ({ ...prev, isRunning: true }));
+    setState((prev: AgentPanelState) => ({ ...prev, isRunning: true }));
 
     try {
       const executeOptions = {
@@ -160,7 +160,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       console.error('Execution failed:', error);
       alert(`Execution failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
-      setState(prev => ({ ...prev, isRunning: false }));
+      setState((prev: AgentPanelState) => ({ ...prev, isRunning: false }));
     }
   };
 
@@ -259,7 +259,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             <input
               type="text"
               value={state.project}
-              onChange={(e) => setState(prev => ({ ...prev, project: e.target.value }))}
+              onChange={(e) => setState((prev: AgentPanelState) => ({ ...prev, project: e.target.value }))}
               placeholder="Enter project name"
               disabled={state.isRunning}
               style={{
@@ -286,7 +286,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             </label>
             <select
               value={state.mode}
-              onChange={(e) => setState(prev => ({ ...prev, mode: e.target.value as ExecutionMode }))}
+              onChange={(e) => setState((prev: AgentPanelState) => ({ ...prev, mode: e.target.value as ExecutionMode }))}
               disabled={state.isRunning}
               style={{
                 width: '100%',
@@ -317,7 +317,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             </label>
             <select
               value={state.aiEngine}
-              onChange={(e) => setState(prev => ({ ...prev, aiEngine: e.target.value as AIEngine }))}
+              onChange={(e) => setState((prev: AgentPanelState) => ({ ...prev, aiEngine: e.target.value as AIEngine }))}
               disabled={state.isRunning}
               style={{
                 width: '100%',
@@ -595,29 +595,32 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               gap: '12px',
               marginBottom: '16px'
             }}>
-              {Object.entries(state.progress.sub_agent_status).map(([agent, status]) => (
-                <div
-                  key={agent}
-                  style={{
-                    padding: '8px 12px',
-                    backgroundColor: '#f9fafb',
-                    borderRadius: '6px',
-                    textAlign: 'center',
-                    border: `2px solid ${getAgentStatusColor(status)}`
-                  }}
-                >
-                  <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '2px' }}>
-                    {agent.charAt(0).toUpperCase() + agent.slice(1)}
+              {Object.entries(state.progress.sub_agent_status).map(([agent, status]: [string, any]) => {
+                const statusStr = status as string;
+                return (
+                  <div
+                    key={agent}
+                    style={{
+                      padding: '8px 12px',
+                      backgroundColor: '#f9fafb',
+                      borderRadius: '6px',
+                      textAlign: 'center',
+                      border: `2px solid ${getAgentStatusColor(statusStr)}`
+                    }}
+                  >
+                    <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '2px' }}>
+                      {agent.charAt(0).toUpperCase() + agent.slice(1)}
+                    </div>
+                    <div style={{
+                      fontSize: '12px',
+                      fontWeight: '500',
+                      color: getAgentStatusColor(statusStr)
+                    }}>
+                      {statusStr.replace('_', ' ').toUpperCase()}
+                    </div>
                   </div>
-                  <div style={{
-                    fontSize: '12px',
-                    fontWeight: '500',
-                    color: getAgentStatusColor(status)
-                  }}>
-                    {status.replace('_', ' ').toUpperCase()}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* Completed Stages */}
@@ -631,7 +634,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   flexWrap: 'wrap',
                   gap: '6px'
                 }}>
-                  {state.progress.stages_completed.map((stage, index) => (
+                  {state.progress.stages_completed.map((stage: string, index: number) => (
                     <span
                       key={index}
                       style={{
@@ -710,7 +713,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               </div>
             ) : (
               <div style={{ fontSize: '12px', fontFamily: 'monospace' }}>
-                {state.logs.slice().reverse().map((log, index) => (
+                {state.logs.slice().reverse().map((log: LogEntry, index: number) => (
                   <div
                     key={log.id || index}
                     style={{
